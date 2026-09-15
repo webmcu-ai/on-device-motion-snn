@@ -117,11 +117,18 @@ U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
 // ======================================================
 // CONFIGURATION
 // ======================================================
-#define NUM_CLASSES 3
-String myClassLabels[NUM_CLASSES] = {"0Still", "1Punch", "2Wave"};
-// Serial hotkeys '0'-'9' are reserved for class selection (see myMenuHotkey
-// further down), so NUM_CLASSES can grow freely up to 10 without touching
-// any action hotkey. Add more labels above and bump this value to go past 3.
+#define NUM_CLASSES 10
+// Index (not the label text) is what the '0'-'9' hotkeys bind to, so
+// renaming a slot below never disturbs its hotkey. Unused slots are just
+// placeholders - rename one (and start collecting) whenever you're ready
+// to actually use it. NOTE: the on-SD folder name is always whatever
+// string is here AT COMPILE TIME - renaming a slot after you've already
+// collected samples under the old name leaves those samples orphaned
+// under the old folder unless you rename that SD folder too.
+String myClassLabels[NUM_CLASSES] = {
+  "0Still", "1Punch", "2Wave", "3class", "4class",
+  "5class", "6class", "7class", "8class", "9class"
+};
 static_assert(NUM_CLASSES <= 10, "Digit hotkeys only cover classes 0-9 - reduce NUM_CLASSES or extend the hotkey scheme.");
 
 // 5 actions beyond the per-class collectors:
@@ -478,6 +485,35 @@ int myCountSamples(int classIdx){
   int count=0; while(File f=root.openNextFile()){ if(!f.isDirectory()&&String(f.name()).endsWith(".csv")) count++; f.close(); }
   root.close(); return count;
 }
+
+// ======================================================
+// ACTIVE-CLASS MASK — makes "only trained classes are ever predicted"
+// an explicit guarantee rather than something that merely tends to
+// happen once enough gradient steps have suppressed an empty class's
+// output. Refreshed right before training and right before inference;
+// argmax loops in inference skip any index where this is false.
+// ======================================================
+bool gActiveClassMask[NUM_CLASSES];
+// Train+Infer SNN trains live from RAM and never writes a CSV to SD (see
+// myActionTrainInferSnn), so a class used only that way would otherwise
+// look permanently empty to myCountSamples(). Track "trained this power
+// cycle" separately and OR it into the mask. Caveat: this flag resets on
+// reboot, so a class trained ONLY via Train+Infer (never via Collect)
+// will look inactive again after a power cycle even though its saved
+// weights still reflect that training - collect at least one real sample
+// per class you care about if you want it to survive a reboot.
+bool gClassEverTrained[NUM_CLASSES] = {};
+void myRefreshActiveClassMask(){
+  bool anyActive=false;
+  for(int c=0;c<NUM_CLASSES;c++){ gActiveClassMask[c] = (myCountSamples(c) > 0) || gClassEverTrained[c]; if(gActiveClassMask[c]) anyActive=true; }
+  if(!anyActive) for(int c=0;c<NUM_CLASSES;c++) gActiveClassMask[c]=true;  // degenerate fallback: nothing has data, don't hard-exclude everything
+}
+int myArgmaxActive(float* scores, int size){
+  int best=-1;
+  for(int j=0;j<size;j++){ if(!gActiveClassMask[j]) continue; if(best==-1 || scores[j]>scores[best]) best=j; }
+  return (best==-1) ? 0 : best;
+}
+
 bool myCaptureSample(int classIdx){
   String folderPath="/motion/"+myClassLabels[classIdx];
   if(!SD.exists("/motion")) SD.mkdir("/motion");
@@ -549,8 +585,9 @@ void myActionTrainAnn(){
   if(!mySDavailable){ Serial.println("[ANN] No SD card - can't train."); myResetMenuState(); return; }
   Serial.println("\n=== Train ANN (windowed Conv1D+Dense, backprop+Adam) ===");
   int cc[NUM_CLASSES]={}; myBuildTrainingList(cc);
+  myRefreshActiveClassMask();
   Serial.print("[ANN] Samples found: ");
-  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d ", myClassLabels[c].c_str(), cc[c]);
+  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d%s ", myClassLabels[c].c_str(), cc[c], cc[c]==0?"(empty)":"");
   Serial.printf("(total=%d)\n", (int)myTrainingData.size());
   if(myTrainingData.empty()){ Serial.println("[ANN] No training samples - collect data first. Aborting."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No samples!");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   std::random_shuffle(myTrainingData.begin(),myTrainingData.end());
@@ -578,6 +615,7 @@ void myActionTrainAnn(){
       int pred=0; for(int j=1;j<NUM_CLASSES;j++) if(myAnnFinal[j]>myAnnFinal[pred]) pred=j;
       if(pred==label) correct++;
       myAnnBackward(myAnnRawBuf,label);
+      gClassEverTrained[label]=true;
       processed++;
       if((si+1)%BATCH_SIZE==0 || si==(int)myTrainingData.size()-1){
         float sc=1.0f/processed;
@@ -621,6 +659,7 @@ void myActionTrainAnn(){
 void myActionInferAnn(){
   if(!gAnn.trained){ Serial.println("[ANN] No trained weights yet - run 'Train ANN' first."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No ANN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   Serial.println("\n--- Infer ANN (windowed, majority-vote over last 3 windows) ---");
+  myRefreshActiveClassMask();
   Serial.println("Move the sensor. 3x TAP (or send 'l') to return to menu.");
   int windowCount=0, voteBuf[3]={0,0,0}, voteIdx=0, finalPred=0;
   while(true){
@@ -632,10 +671,10 @@ void myActionInferAnn(){
       long el=millis()-tS; if(el<SAMPLE_INTERVAL_MS) delay(SAMPLE_INTERVAL_MS-el);
     }
     myNormalizeInput(myAnnRawBuf); myAnnForward(myAnnRawBuf);
-    int rawPred=0; for(int j=1;j<NUM_CLASSES;j++) if(myAnnFinal[j]>myAnnFinal[rawPred]) rawPred=j;
+    int rawPred=myArgmaxActive(myAnnFinal,NUM_CLASSES);
     windowCount++; voteBuf[voteIdx%3]=rawPred; voteIdx++;
     int votes[NUM_CLASSES]={}; for(int v=0;v<3;v++) votes[voteBuf[v]]++;
-    finalPred=0; for(int j=1;j<NUM_CLASSES;j++) if(votes[j]>votes[finalPred]) finalPred=j;
+    { int best=voteBuf[0]; for(int v=1;v<3;v++) if(votes[voteBuf[v]]>votes[best]) best=voteBuf[v]; finalPred=best; }
     Serial.printf("[ANN] #%d raw=%s vote=%s\n",windowCount,myClassLabels[rawPred].c_str(),myClassLabels[finalPred].c_str());
     u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,"ANN:");u8g2.drawStr(0,18,myClassLabels[finalPred].c_str());}while(u8g2.nextPage());
   }
@@ -808,7 +847,7 @@ int mySnnTick(float* rawSpikeSample, bool record, int tIdx){
     if (record){ rOutCurrent[tIdx*NUM_CLASSES+c]=current; rTrace[tIdx*NUM_CLASSES+c]=gStreamTrace[c]; }
   }
 
-  int pred=0; for(int c=1;c<NUM_CLASSES;c++) if(gStreamTrace[c]>gStreamTrace[pred]) pred=c;
+  int pred=myArgmaxActive(gStreamTrace,NUM_CLASSES);
   return pred;
 }
 
@@ -989,8 +1028,9 @@ void myActionTrainSnn(){
   if(!mySDavailable){ Serial.println("[SNN] No SD card - can't train."); myResetMenuState(); return; }
   Serial.println("\n=== Train SNN (streaming, causal, surrogate-gradient BPTT) ===");
   int cc[NUM_CLASSES]={}; myBuildTrainingList(cc);
+  myRefreshActiveClassMask();
   Serial.print("[SNN] Samples found: ");
-  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d ", myClassLabels[c].c_str(), cc[c]);
+  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d%s ", myClassLabels[c].c_str(), cc[c], cc[c]==0?"(empty)":"");
   Serial.printf("(total=%d)\n", (int)myTrainingData.size());
   if(myTrainingData.empty()){ Serial.println("[SNN] No training samples - collect data first. Aborting."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No samples!");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   std::random_shuffle(myTrainingData.begin(),myTrainingData.end());
@@ -1027,6 +1067,7 @@ void myActionTrainSnn(){
       mySnnZeroGrad();
       mySnnBackwardBPTT(label);
       mySnnApplyAdam();
+      gClassEverTrained[label]=true;
     }
     float valAcc=0;
     if(valCount>0){
@@ -1069,6 +1110,7 @@ void myActionTrainSnn(){
 void myActionInferSnnContinuous(){
   if(!gSnn.trained){ Serial.println("[SNN] No trained weights yet - run 'Train SNN' or 'Train+Infer SNN' first."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No SNN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   Serial.println("\n--- Infer SNN (continuous streaming, no windowing) ---");
+  myRefreshActiveClassMask();
   Serial.println("Move the sensor. 3x TAP (or send 'l') to return to menu.");
   mySnnResetStreamState();
   float prevNorm[IMU_AXES]={0,0,0}; bool havePrev=false;
@@ -1157,6 +1199,8 @@ void myActionTrainInferSnn(){
     mySnnZeroGrad();
     mySnnBackwardBPTT(label);
     mySnnApplyAdam();
+    gClassEverTrained[label]=true;
+    myRefreshActiveClassMask();
     gSnn.trained = true;
     mySnnSaveWeights();
 
@@ -1205,8 +1249,12 @@ char myMenuHotkey(int idx){
 }
 void myPrintStatus(){
   Serial.println("\n=== STATUS ===");
+  myRefreshActiveClassMask();
   Serial.print("Samples per class: ");
-  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d ", myClassLabels[c].c_str(), myCountSamples(c));
+  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d%s ", myClassLabels[c].c_str(), myCountSamples(c), myCountSamples(c)==0?"(empty)":"");
+  Serial.println();
+  Serial.print("Active for prediction (has samples or was trained live this session): ");
+  for(int c=0;c<NUM_CLASSES;c++) if(gActiveClassMask[c]) Serial.printf("%s ", myClassLabels[c].c_str());
   Serial.println();
   Serial.printf("ANN: trained=%d  freeze conv1=%d dense1=%d dense2=%d output=%d  adamStep=%d\n",
                 gAnn.trained, gAnn.freezeConv1, gAnn.freezeDense1, gAnn.freezeDense2, gAnn.freezeOutput, gAnn.adamStep);
@@ -1306,6 +1354,7 @@ void setup(){
 
   myAnnLoadWeights();
   mySnnLoadWeights();
+  myRefreshActiveClassMask();
 
   myResetMenuState();
   Serial.println("System ready.");
