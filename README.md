@@ -2,6 +2,9 @@
 spiking neural network testing
 
 
+This is all part of my on-device and webAI Github Organization at   https://github.com/webmcu-ai
+
+
 
 Uses the XIAO ML Kit by Seeedstudio. https://www.seeedstudio.com/The-XIAOML-Kit.html  and the new Arduino IDE.
 
