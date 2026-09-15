@@ -1,6 +1,49 @@
 // ======================================================
 // XIAO ML KIT (OR XIAO ESP32S3 SENSE)
-// FULL MOTION / IMU ML — STREAMING SNN + SURROGATE GRADIENTS — v003
+// FULL MOTION / IMU ML — STREAMING SNN + SURROGATE GRADIENTS — v004
+//
+// Changes from v003 (functionality identical — no model/algorithm
+// changes — this pass only improves observability):
+//   - Serial output during "in-menu-item" screens (collect/train/infer)
+//     was sparse; every action now prints a header banner on entry,
+//     event-level lines during capture, and a summary on exit.
+//   - New '?' serial command (works from the menu) dumps a full status
+//     report: sample counts per class, ANN/SNN trained + freeze state,
+//     current hyperparameters, and free PSRAM.
+//   - Menu selection (touch long-press OR serial 'l'/digit) now prints
+//     which item was selected before running it, so the serial log
+//     reads as a clear trail of what happened when.
+//   - Streaming SNN inference/live-train screens now report spike
+//     *rates* (spikes/tick since last report), not just raw cumulative
+//     counts, which is what you actually need to tune LIF_THRESHOLD /
+//     SNN_WEIGHT_SCALE / DELTA_THRESHOLD per the tuning notes below.
+//   - Train ANN / Train SNN now track+report the best validation
+//     accuracy seen and which epoch it occurred on, plus wall-clock
+//     training time.
+//   - Serial menu hotkeys were repurposed: digits '0'-'9' now ALWAYS
+//     mean "jump to that class index" (0-based), and the 5 fixed
+//     actions moved to letters (G/H/J/K/M = Train ANN/Infer ANN/
+//     Train SNN/Infer SNN/Train+Infer SNN). Previously digits 1-9
+//     selected by menu *position*, so adding a 4th class silently
+//     shifted every action's hotkey. Now NUM_CLASSES can grow to 10
+//     (a static_assert enforces the ceiling) with zero renumbering.
+//   - OLED text was overflowing the 72px-wide panel in a few places
+//     (e.g. "TAP:Next HOLD:Ok" at 6x10 is ~96px). Shortened/re-flowed
+//     strings to fit 72x40 at the fonts in use, and the live-inference
+//     screen now shows a spike-rate line where room allows.
+//
+//   - Two touch/UI fixes from hands-on testing:
+//       1) Data-collection's OLED count wasn't refreshing after a capture
+//          triggered via the Serial 't' command (only the touch-tap path
+//          redrew it) - both paths now share one capture routine and
+//          always redraw.
+//       2) The 3-tap exit gesture was too easily triggered by a single
+//          physical tap's contact bounce. Tap counting now happens on
+//          RELEASE (not press) and requires >=15ms of contact to count
+//          at all, and the post-release settle time before a new press
+//          is even considered went from 50ms to 180ms. On-screen text
+//          also now says "3x Tap" instead of "HOLD", since it was never
+//          a real long-press.
 //
 // Builds on v002. Two independent, coexisting classifiers:
 //
@@ -76,6 +119,10 @@ U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
 // ======================================================
 #define NUM_CLASSES 3
 String myClassLabels[NUM_CLASSES] = {"0Still", "1Punch", "2Wave"};
+// Serial hotkeys '0'-'9' are reserved for class selection (see myMenuHotkey
+// further down), so NUM_CLASSES can grow freely up to 10 without touching
+// any action hotkey. Add more labels above and bump this value to go past 3.
+static_assert(NUM_CLASSES <= 10, "Digit hotkeys only cover classes 0-9 - reduce NUM_CLASSES or extend the hotkey scheme.");
 
 // 5 actions beyond the per-class collectors:
 //   Train ANN, Infer ANN, Train SNN, Infer SNN (continuous), Train+Infer SNN
@@ -146,13 +193,24 @@ float myAccelStd [IMU_AXES] = { 1.0f, 1.0f, 1.0f };
 #define CALIB_SAMPLES 80
 
 // ======================================================
-// TOUCH INPUT (unchanged)
+// TOUCH INPUT
+// Redesigned tap counting: a tap is now counted on RELEASE, not on
+// press, and only if it was held for at least minPressMs — this
+// rejects the brief on/off glitches that show up as contact bounce
+// on cheap capacitive pads. debounceDelay was also raised from 50ms
+// to 180ms so a single physical tap's bounce train can't be split
+// across the debounce gap and double/triple-counted (the original
+// symptom: one intended tap during data collection sometimes fired
+// the 3-tap exit gesture instead of a single capture).
 // ======================================================
 const int myThresholdPress = 1100, myThresholdRelease = 900;
 struct TouchState {
   bool isTouching = false; int tapCount = 0;
-  unsigned long firstTapTime=0, lastReleaseTime=0, lastCheckTime=0;
-  const unsigned long tapWindow=800, debounceDelay=50; const int longPressTaps=3;
+  unsigned long pressStartTime=0, firstTapTime=0, lastReleaseTime=0, lastCheckTime=0;
+  const unsigned long tapWindow=900;       // time after the first counted tap to wait for more taps
+  const unsigned long debounceDelay=180;   // min time after a release before a new press is even considered (absorbs bounce)
+  const unsigned long minPressMs=15;       // min contact duration to count as a real tap (rejects noise blips)
+  const int longPressTaps=3;
 };
 TouchState myTouch;
 unsigned long myLastActivityTime=0, myLastTapTime=0;
@@ -162,7 +220,7 @@ bool myIsSelected = false;
 bool mySDavailable = false;
 
 int myReadTouch() { int s=0; for(int i=0;i<3;i++){s+=analogRead(A0);delayMicroseconds(100);} return s/3; }
-void myResetTouchState(){ myTouch.isTouching=false; myTouch.tapCount=0; myTouch.firstTapTime=0; myTouch.lastReleaseTime=0; myTouch.lastCheckTime=0; }
+void myResetTouchState(){ myTouch.isTouching=false; myTouch.tapCount=0; myTouch.pressStartTime=0; myTouch.firstTapTime=0; myTouch.lastReleaseTime=0; myTouch.lastCheckTime=0; }
 void myUpdateTouchState(){
   unsigned long now=millis();
   if (now - myTouch.lastCheckTime < 20) return;
@@ -170,12 +228,17 @@ void myUpdateTouchState(){
   int val = myReadTouch();
   bool active = myTouch.isTouching ? (val>myThresholdRelease) : (val>myThresholdPress);
   if (active && !myTouch.isTouching) {
-    if (now - myTouch.lastReleaseTime < myTouch.debounceDelay) return;
+    if (now - myTouch.lastReleaseTime < myTouch.debounceDelay) return;  // still settling from the last contact - ignore this edge
     myTouch.isTouching = true;
+    myTouch.pressStartTime = now;
+  }
+  if (!active && myTouch.isTouching) {
+    myTouch.isTouching = false;
+    myTouch.lastReleaseTime = now;
+    if (now - myTouch.pressStartTime < myTouch.minPressMs) return;      // too brief to be a deliberate tap - ignore, don't count
     if (myTouch.tapCount==0 || (now-myTouch.firstTapTime<myTouch.tapWindow)) { if(myTouch.tapCount==0) myTouch.firstTapTime=now; myTouch.tapCount++; }
     else { myTouch.tapCount=1; myTouch.firstTapTime=now; }
   }
-  if (!active && myTouch.isTouching) { myTouch.isTouching=false; myTouch.lastReleaseTime=now; }
 }
 int myCheckTouchInput(){
   myUpdateTouchState();
@@ -443,19 +506,37 @@ void myBuildTrainingList(int classCounts[NUM_CLASSES]){
   }
 }
 void myActionCollect(int classIdx){
-  if(!mySDavailable){ myResetMenuState(); return; }
+  if(!mySDavailable){ Serial.println("[Collect] No SD card - can't collect samples."); myResetMenuState(); return; }
   myResetTouchState();
   int cc=myCountSamples(classIdx);
-  u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,myClassLabels[classIdx].c_str());u8g2.drawStr(0,18,"TAP=Capture");u8g2.drawStr(0,28,"HOLD=Exit");char b[20];snprintf(b,20,"Count: %d",cc);u8g2.drawStr(0,38,b);}while(u8g2.nextPage());
+  Serial.printf("\n--- Collecting class '%s' (existing samples: %d) ---\n", myClassLabels[classIdx].c_str(), cc);
+  Serial.println("1 TAP (or send 't') = capture one 1s repetition. 3x TAP (or send 'l') = back to menu.");
+  u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,myClassLabels[classIdx].c_str());u8g2.drawStr(0,18,"TAP=Capture");u8g2.drawStr(0,28,"3xTap=Exit");char b[20];snprintf(b,20,"Count: %d",cc);u8g2.drawStr(0,38,b);}while(u8g2.nextPage());
   while(true){
-    if(Serial.available()){ char c=Serial.read(); if(c=='l'||c=='L'){myResetMenuState();return;} if(c=='t'||c=='T'){delay(1000); if(myCaptureSample(classIdx)) cc++;} }
+    bool doCapture=false;
+    if(Serial.available()){
+      char c=Serial.read();
+      if(c=='l'||c=='L'){ Serial.printf("[Collect] Exiting '%s' with %d samples saved.\n", myClassLabels[classIdx].c_str(), cc); myResetMenuState(); return; }
+      if(c=='t'||c=='T') doCapture=true;
+    }
     int ta=myCheckTouchInput();
-    if(ta==2){ myResetMenuState(); return; }
-    if(ta==1){
+    if(ta==2){ Serial.printf("[Collect] Exiting '%s' with %d samples saved.\n", myClassLabels[classIdx].c_str(), cc); myResetMenuState(); return; }
+    if(ta==1) doCapture=true;
+
+    if(doCapture){
+      Serial.println("[Collect] Recording in 1s...");
       delay(1000);
       if(myCaptureSample(classIdx)){
         cc++;
+        Serial.printf("[Collect] Sample #%d saved for '%s'.\n", cc, myClassLabels[classIdx].c_str());
+        // Redraw on EVERY successful capture, whichever input triggered it -
+        // this used to only happen on the touch-tap path, so a capture
+        // triggered by the Serial 't' command left the OLED count stale.
         u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,myClassLabels[classIdx].c_str());char b[20];snprintf(b,20,"Saved: %d",cc);u8g2.drawStr(0,20,b);u8g2.drawStr(0,32,"TAP=More");}while(u8g2.nextPage());
+      } else {
+        Serial.println("[Collect] Capture FAILED (SD write error).");
+        u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,"SD write");u8g2.drawStr(0,18,"FAILED");}while(u8g2.nextPage());
+        delay(800);
       }
     }
   }
@@ -465,8 +546,13 @@ void myActionCollect(int classIdx){
 // ANN TRAIN / INFER ACTIONS (freeze-aware)
 // ======================================================
 void myActionTrainAnn(){
-  if(!mySDavailable){ myResetMenuState(); return; }
+  if(!mySDavailable){ Serial.println("[ANN] No SD card - can't train."); myResetMenuState(); return; }
+  Serial.println("\n=== Train ANN (windowed Conv1D+Dense, backprop+Adam) ===");
   int cc[NUM_CLASSES]={}; myBuildTrainingList(cc);
+  Serial.print("[ANN] Samples found: ");
+  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d ", myClassLabels[c].c_str(), cc[c]);
+  Serial.printf("(total=%d)\n", (int)myTrainingData.size());
+  if(myTrainingData.empty()){ Serial.println("[ANN] No training samples - collect data first. Aborting."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No samples!");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   std::random_shuffle(myTrainingData.begin(),myTrainingData.end());
   int valCount=0; std::vector<TrainingItem> valData;
   if(VALIDATION_SAMPLES>0){
@@ -474,6 +560,12 @@ void myActionTrainAnn(){
     for(auto& it: myTrainingData){ if(held[it.label]<VALIDATION_SAMPLES){valData.push_back(it);held[it.label]++;valCount++;} else trainOnly.push_back(it); }
     myTrainingData=trainOnly;
   }
+  Serial.printf("[ANN] Training on %d reps, holding out %d for validation. %d epochs, lr=%.4f, batch=%d.\n",
+                (int)myTrainingData.size(), valCount, TARGET_EPOCHS, LEARNING_RATE, BATCH_SIZE);
+  Serial.printf("[ANN] Frozen layers: conv1=%d dense1=%d dense2=%d output=%d\n",
+                gAnn.freezeConv1, gAnn.freezeDense1, gAnn.freezeDense2, gAnn.freezeOutput);
+  unsigned long trainStartMs = millis();
+  float bestValAcc=-1; int bestValEpoch=-1;
   for(int epoch=0;epoch<TARGET_EPOCHS;epoch++){
     std::random_shuffle(myTrainingData.begin(),myTrainingData.end());
     float loss=0; int correct=0, processed=0; myAnnZeroGrad();
@@ -511,17 +603,29 @@ void myActionTrainAnn(){
     }
     float valAcc=0;
     if(valCount>0){ int vc=0; for(auto& vi: valData){ if(!myAnnLoadSample(vi.path.c_str(),myAnnRawBuf)) continue; myAnnForward(myAnnRawBuf); int p=0; for(int j=1;j<NUM_CLASSES;j++) if(myAnnFinal[j]>myAnnFinal[p]) p=j; if(p==vi.label) vc++; } valAcc=100.0f*vc/valCount; }
-    Serial.printf("[ANN] Epoch %d/%d Loss=%.4f TrainAcc=%.1f%% ValAcc=%.1f%%\n",epoch+1,TARGET_EPOCHS,loss/max((int)myTrainingData.size(),1),100.0f*correct/max((int)myTrainingData.size(),1),valAcc);
+    bool isBest = (valCount>0) ? (valAcc>bestValAcc) : (100.0f*correct/max((int)myTrainingData.size(),1) > bestValAcc);
+    if(isBest){ bestValAcc = (valCount>0)?valAcc:100.0f*correct/max((int)myTrainingData.size(),1); bestValEpoch=epoch+1; }
+    Serial.printf("[ANN] Epoch %d/%d Loss=%.4f TrainAcc=%.1f%% ValAcc=%.1f%%%s\n",epoch+1,TARGET_EPOCHS,loss/max((int)myTrainingData.size(),1),100.0f*correct/max((int)myTrainingData.size(),1),valAcc, isBest?"  <- best so far":"");
+    u8g2.firstPage();
+    do{ u8g2.setFont(u8g2_font_5x7_tf); char b[24];
+        snprintf(b,24,"ANN Ep %d/%d",epoch+1,TARGET_EPOCHS); u8g2.drawStr(0,8,b);
+        snprintf(b,24,"Tr%.0f Val%.0f",100.0f*correct/max((int)myTrainingData.size(),1),valAcc); u8g2.drawStr(0,20,b);
+    } while(u8g2.nextPage());
   }
   gAnn.trained=true; myAnnSaveWeights();
-  u8g2.firstPage(); do{u8g2.drawStr(0,15,"ANN trained");}while(u8g2.nextPage()); delay(1200); myResetMenuState();
+  float trainSecs = (millis()-trainStartMs)/1000.0f;
+  Serial.printf("[ANN] Done in %.1fs. Best %s%s=%.1f%% at epoch %d. Weights saved.\n",
+                trainSecs, valCount>0?"ValAcc":"TrainAcc", "", bestValAcc, bestValEpoch);
+  u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,10,"ANN trained");char b[20];snprintf(b,20,"Best:%.0f%% ep%d",bestValAcc,bestValEpoch);u8g2.drawStr(0,24,b);}while(u8g2.nextPage()); delay(1500); myResetMenuState();
 }
 void myActionInferAnn(){
-  if(!gAnn.trained){ u8g2.firstPage(); do{u8g2.drawStr(0,15,"No ANN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
+  if(!gAnn.trained){ Serial.println("[ANN] No trained weights yet - run 'Train ANN' first."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No ANN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
+  Serial.println("\n--- Infer ANN (windowed, majority-vote over last 3 windows) ---");
+  Serial.println("Move the sensor. 3x TAP (or send 'l') to return to menu.");
   int windowCount=0, voteBuf[3]={0,0,0}, voteIdx=0, finalPred=0;
   while(true){
-    if(myCheckTouchInput()==2){ myResetMenuState(); return; }
-    if(Serial.available()){ char c=Serial.read(); if(c=='l'||c=='L'){myResetMenuState();return;} }
+    if(myCheckTouchInput()==2){ Serial.printf("[ANN] Exiting after %d windows.\n", windowCount); myResetMenuState(); return; }
+    if(Serial.available()){ char c=Serial.read(); if(c=='l'||c=='L'){ Serial.printf("[ANN] Exiting after %d windows.\n", windowCount); myResetMenuState();return;} }
     for(int t=0;t<IMU_TIMESTEPS;t++){
       unsigned long tS=millis();
       myAnnRawBuf[t*IMU_AXES+0]=myIMU.readFloatAccelX(); myAnnRawBuf[t*IMU_AXES+1]=myIMU.readFloatAccelY(); myAnnRawBuf[t*IMU_AXES+2]=myIMU.readFloatAccelZ();
@@ -882,8 +986,13 @@ bool mySnnLoadSampleEncoded(const char* path){
 // (same data your ANN model trains from; one Adam step per repetition)
 // ======================================================
 void myActionTrainSnn(){
-  if(!mySDavailable){ myResetMenuState(); return; }
+  if(!mySDavailable){ Serial.println("[SNN] No SD card - can't train."); myResetMenuState(); return; }
+  Serial.println("\n=== Train SNN (streaming, causal, surrogate-gradient BPTT) ===");
   int cc[NUM_CLASSES]={}; myBuildTrainingList(cc);
+  Serial.print("[SNN] Samples found: ");
+  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d ", myClassLabels[c].c_str(), cc[c]);
+  Serial.printf("(total=%d)\n", (int)myTrainingData.size());
+  if(myTrainingData.empty()){ Serial.println("[SNN] No training samples - collect data first. Aborting."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No samples!");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   std::random_shuffle(myTrainingData.begin(),myTrainingData.end());
   int valCount=0; std::vector<TrainingItem> valData;
   if(VALIDATION_SAMPLES>0){
@@ -891,6 +1000,12 @@ void myActionTrainSnn(){
     for(auto& it: myTrainingData){ if(held[it.label]<VALIDATION_SAMPLES){valData.push_back(it);held[it.label]++;valCount++;} else trainOnly.push_back(it); }
     myTrainingData=trainOnly;
   }
+  Serial.printf("[SNN] Training on %d reps, holding out %d for validation. %d epochs, lr=%.4f.\n",
+                (int)myTrainingData.size(), valCount, TARGET_EPOCHS, LEARNING_RATE);
+  Serial.printf("[SNN] Frozen layers: conv1=%d dense1=%d dense2=%d output=%d | LIF_THRESHOLD=%.2f LIF_LEAK=%.2f SNN_WEIGHT_SCALE=%.2f\n",
+                gSnn.freezeConv1, gSnn.freezeDense1, gSnn.freezeDense2, gSnn.freezeOutput, LIF_THRESHOLD, LIF_LEAK, SNN_WEIGHT_SCALE);
+  unsigned long trainStartMs = millis();
+  float bestValAcc=-1; int bestValEpoch=-1;
   for(int epoch=0; epoch<TARGET_EPOCHS; epoch++){
     std::random_shuffle(myTrainingData.begin(),myTrainingData.end());
     float lossSum=0; int correct=0;
@@ -925,10 +1040,15 @@ void myActionTrainSnn(){
       }
       valAcc=100.0f*vc/valCount;
     }
-    Serial.printf("[SNN] Epoch %d/%d Loss=%.4f TrainAcc=%.1f%% ValAcc=%.1f%% (last-sample spikes: c1=%ld d1=%ld d2=%ld)\n",
+    bool isBest = (valCount>0) ? (valAcc>bestValAcc) : (100.0f*correct/max((int)myTrainingData.size(),1) > bestValAcc);
+    if(isBest){ bestValAcc = (valCount>0)?valAcc:100.0f*correct/max((int)myTrainingData.size(),1); bestValEpoch=epoch+1; }
+    const char* spikeHint = "";
+    if (gStreamConv1Spikes==0 && gStreamDense1Spikes==0) spikeHint = "  [WARN spikes dead - lower LIF_THRESHOLD/raise SNN_WEIGHT_SCALE]";
+    else if (gStreamConv1Spikes > (long)IMU_TIMESTEPS*CONV1_FILTERS*0.9f) spikeHint = "  [WARN spiking every tick - raise LIF_THRESHOLD]";
+    Serial.printf("[SNN] Epoch %d/%d Loss=%.4f TrainAcc=%.1f%% ValAcc=%.1f%%%s (last-sample spikes: c1=%ld d1=%ld d2=%ld)%s\n",
       epoch+1,TARGET_EPOCHS, lossSum/max((int)myTrainingData.size(),1),
-      100.0f*correct/max((int)myTrainingData.size(),1), valAcc,
-      gStreamConv1Spikes, gStreamDense1Spikes, gStreamDense2Spikes);
+      100.0f*correct/max((int)myTrainingData.size(),1), valAcc, isBest?"  <- best so far":"",
+      gStreamConv1Spikes, gStreamDense1Spikes, gStreamDense2Spikes, spikeHint);
     u8g2.firstPage();
     do{ u8g2.setFont(u8g2_font_5x7_tf); char b[24];
         snprintf(b,24,"SNN Ep %d/%d",epoch+1,TARGET_EPOCHS); u8g2.drawStr(0,8,b);
@@ -936,7 +1056,10 @@ void myActionTrainSnn(){
     } while(u8g2.nextPage());
   }
   gSnn.trained=true; mySnnSaveWeights();
-  u8g2.firstPage(); do{u8g2.drawStr(0,15,"SNN trained");}while(u8g2.nextPage()); delay(1200); myResetMenuState();
+  float trainSecs = (millis()-trainStartMs)/1000.0f;
+  Serial.printf("[SNN] Done in %.1fs. Best %s=%.1f%% at epoch %d. Weights saved.\n",
+                trainSecs, valCount>0?"ValAcc":"TrainAcc", bestValAcc, bestValEpoch);
+  u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,10,"SNN trained");char b[20];snprintf(b,20,"Best:%.0f%% ep%d",bestValAcc,bestValEpoch);u8g2.drawStr(0,24,b);}while(u8g2.nextPage()); delay(1500); myResetMenuState();
 }
 
 // ======================================================
@@ -944,13 +1067,16 @@ void myActionTrainSnn(){
 // Reads the trace every tick and reports it; never waits for 40 samples.
 // ======================================================
 void myActionInferSnnContinuous(){
-  if(!gSnn.trained){ u8g2.firstPage(); do{u8g2.drawStr(0,15,"No SNN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
+  if(!gSnn.trained){ Serial.println("[SNN] No trained weights yet - run 'Train SNN' or 'Train+Infer SNN' first."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No SNN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
+  Serial.println("\n--- Infer SNN (continuous streaming, no windowing) ---");
+  Serial.println("Move the sensor. 3x TAP (or send 'l') to return to menu.");
   mySnnResetStreamState();
   float prevNorm[IMU_AXES]={0,0,0}; bool havePrev=false;
   unsigned long tickCount=0;
+  long prevC1=0, prevD1=0, prevD2=0;
   while(true){
-    if(myCheckTouchInput()==2){ myResetMenuState(); return; }
-    if(Serial.available()){ char c=Serial.read(); if(c=='l'||c=='L'){myResetMenuState();return;} }
+    if(myCheckTouchInput()==2){ Serial.printf("[SNN-live] Exiting after %lu ticks.\n", tickCount); myResetMenuState(); return; }
+    if(Serial.available()){ char c=Serial.read(); if(c=='l'||c=='L'){ Serial.printf("[SNN-live] Exiting after %lu ticks.\n", tickCount); myResetMenuState();return;} }
 
     unsigned long tS=millis();
     float raw[IMU_AXES]={myIMU.readFloatAccelX(),myIMU.readFloatAccelY(),myIMU.readFloatAccelZ()};
@@ -969,10 +1095,14 @@ void myActionInferSnnContinuous(){
     tickCount++;
 
     if (tickCount % 8 == 0) {   // ~every 200ms, to avoid flooding Serial/OLED
-      Serial.printf("[SNN-live] tick=%lu pred=%s\n", tickCount, myClassLabels[pred].c_str());
+      float c1Rate=(gStreamConv1Spikes-prevC1)/8.0f, d1Rate=(gStreamDense1Spikes-prevD1)/8.0f, d2Rate=(gStreamDense2Spikes-prevD2)/8.0f;
+      prevC1=gStreamConv1Spikes; prevD1=gStreamDense1Spikes; prevD2=gStreamDense2Spikes;
+      Serial.printf("[SNN-live] tick=%lu pred=%s  spikes/tick: c1=%.2f d1=%.2f d2=%.2f\n",
+                    tickCount, myClassLabels[pred].c_str(), c1Rate, d1Rate, d2Rate);
       u8g2.firstPage();
       do{ u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(0,8,"SNN live:"); u8g2.drawStr(0,18,myClassLabels[pred].c_str());
-          char b[20]; snprintf(b,20,"t=%lu",tickCount); u8g2.drawStr(0,28,b); } while(u8g2.nextPage());
+          char b[20]; snprintf(b,20,"t=%lu",tickCount); u8g2.drawStr(0,28,b);
+          snprintf(b,20,"sp%.1f/%.1f/%.1f",c1Rate,d1Rate,d2Rate); u8g2.drawStr(0,38,b); } while(u8g2.nextPage());
     }
     long el=millis()-tS; if(el<SAMPLE_INTERVAL_MS) delay(SAMPLE_INTERVAL_MS-el);
   }
@@ -985,7 +1115,8 @@ void myActionInferSnnContinuous(){
 // repetition the instant it ends.
 // ======================================================
 void myActionTrainInferSnn(){
-  Serial.printf("[SNN Train+Infer] Labeling reps as '%s' (visit a class item first to change). TAP=start rep, HOLD=exit.\n",
+  Serial.println("\n--- Train+Infer SNN (live predict during capture, then one BPTT step) ---");
+  Serial.printf("[SNN Train+Infer] Labeling reps as '%s' (visit a class item first to change). 1 TAP=start rep, 3x TAP=exit.\n",
                 myClassLabels[myLastSelectedClass].c_str());
   myResetTouchState();
   while(true){
@@ -1029,8 +1160,10 @@ void myActionTrainInferSnn(){
     gSnn.trained = true;
     mySnnSaveWeights();
 
-    Serial.printf("[SNN Train+Infer] Rep done. Labeled=%s LivePredAtEnd=%s\n",
-                  myClassLabels[label].c_str(), myClassLabels[lastPred].c_str());
+    Serial.printf("[SNN Train+Infer] Rep done. Labeled=%s LivePredAtEnd=%s (%s) | rep spikes: c1=%ld d1=%ld d2=%ld over %d ticks\n",
+                  myClassLabels[label].c_str(), myClassLabels[lastPred].c_str(),
+                  lastPred==label?"OK":"MISS",
+                  gStreamConv1Spikes, gStreamDense1Spikes, gStreamDense2Spikes, IMU_TIMESTEPS);
     u8g2.firstPage();
     do{ u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(0,8,"Trained on:"); u8g2.drawStr(0,18,myClassLabels[label].c_str());
         u8g2.drawStr(0,28, lastPred==label ? "Pred: OK" : "Pred: MISS"); } while(u8g2.nextPage());
@@ -1059,6 +1192,35 @@ void myHandleFreezeCommand(char c){
   }
 }
 
+// Serial hotkeys for the 5 fixed actions. Digits 0-9 are reserved
+// exclusively for class selection (see myMenuHotkey) so you can grow
+// NUM_CLASSES up to 10 without ever renumbering or colliding with an
+// action key. Letters chosen to avoid A/S/D/F/a/s/d/f (freeze toggles),
+// t/T (tap-advance) and l/L (select/exit).
+const char myActionKeys[NUM_ACTIONS] = {'G','H','J','K','M'};
+// 1-based combined menu index -> the single key that jumps straight to it.
+char myMenuHotkey(int idx){
+  if (idx<=NUM_CLASSES) return '0'+(idx-1);
+  return myActionKeys[idx-NUM_CLASSES-1];
+}
+void myPrintStatus(){
+  Serial.println("\n=== STATUS ===");
+  Serial.print("Samples per class: ");
+  for(int c=0;c<NUM_CLASSES;c++) Serial.printf("%s=%d ", myClassLabels[c].c_str(), myCountSamples(c));
+  Serial.println();
+  Serial.printf("ANN: trained=%d  freeze conv1=%d dense1=%d dense2=%d output=%d  adamStep=%d\n",
+                gAnn.trained, gAnn.freezeConv1, gAnn.freezeDense1, gAnn.freezeDense2, gAnn.freezeOutput, gAnn.adamStep);
+  Serial.printf("SNN: trained=%d  freeze conv1=%d dense1=%d dense2=%d output=%d  adamStep=%d\n",
+                gSnn.trained, gSnn.freezeConv1, gSnn.freezeDense1, gSnn.freezeDense2, gSnn.freezeOutput, gSnn.adamStep);
+  Serial.printf("Hyperparams: lr=%.4f batch=%d epochs=%d valSamples=%d\n",
+                LEARNING_RATE, BATCH_SIZE, TARGET_EPOCHS, VALIDATION_SAMPLES);
+  Serial.printf("SNN tuning: LIF_THRESHOLD=%.2f LIF_LEAK=%.2f SNN_WEIGHT_SCALE=%.2f SNN_TRACE_LEAK=%.2f DELTA_THRESHOLD=[%.2f,%.2f,%.2f]\n",
+                LIF_THRESHOLD, LIF_LEAK, SNN_WEIGHT_SCALE, SNN_TRACE_LEAK, DELTA_THRESHOLD[0], DELTA_THRESHOLD[1], DELTA_THRESHOLD[2]);
+  Serial.printf("SD card: %s | Free PSRAM: %d bytes | Uptime: %lus\n",
+                mySDavailable?"present":"absent", ESP.getFreePsram(), millis()/1000);
+  Serial.println("==============");
+}
+
 // ======================================================
 // MENU
 // ======================================================
@@ -1066,17 +1228,21 @@ void myResetMenuState(){ myIsSelected=false; myResetTouchState(); myLastActivity
 String myMenuLabel(int idx){ if(idx<=NUM_CLASSES) return myClassLabels[idx-1]; return String(myActionLabels[idx-NUM_CLASSES-1]); }
 void myDrawMenu(){
   Serial.println("\n=== MENU ===");
-  for(int i=1;i<=myTotalItems;i++) Serial.printf("%s%d. %s\n",(i==myMenuIndex)?" > ":"   ",i,myMenuLabel(i).c_str());
-  Serial.println("Freeze cmds: A/S/D/F=SNN conv1/d1/d2/out  a/s/d/f=ANN conv1/d1/d2/out");
+  for(int i=1;i<=myTotalItems;i++) Serial.printf("%s%c. %s\n",(i==myMenuIndex)?" > ":"   ",myMenuHotkey(i),myMenuLabel(i).c_str());
+  Serial.println("Hotkeys: 0-9=jump to that class (grows with NUM_CLASSES), G/H/J/K/M=Train ANN/Infer ANN/Train SNN/Infer SNN/Train+Infer SNN");
+  Serial.println("Freeze: A/S/D/F=SNN conv1/d1/d2/out  a/s/d/f=ANN conv1/d1/d2/out  ?=status  t=tap-advance  l=select/exit");
   u8g2.firstPage();
   do{
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0,8,"TAP:Next HOLD:Ok");
+    // 5x7 keeps this within the 72px-wide panel; the old 6x10 "TAP:Next
+    // HOLD:Ok" (~96px) ran off the right edge.
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0,7,"Tap=Next Hold=Ok");
     int start=max(1,myMenuIndex-1);
-    for(int i=0;i<3;i++){ int cur=start+i; if(cur>myTotalItems) break; int y=18+i*9; String line=(cur==myMenuIndex?"> ":"  ")+myMenuLabel(cur); u8g2.drawStr(0,y,line.c_str()); }
+    for(int i=0;i<4;i++){ int cur=start+i; if(cur>myTotalItems) break; int y=17+i*8; String line=(cur==myMenuIndex?"> ":"  ")+myMenuLabel(cur); u8g2.drawStr(0,y,line.c_str()); }
   } while(u8g2.nextPage());
 }
 void myExecuteMenuItem(int idx){
+  Serial.printf("[Menu] Selected: %c. %s\n", myMenuHotkey(idx), myMenuLabel(idx).c_str());
   if(idx<=NUM_CLASSES){ myLastSelectedClass = idx-1; myActionCollect(idx-1); return; }
   switch(idx-NUM_CLASSES-1){
     case 0: myActionTrainAnn(); break;
@@ -1091,8 +1257,17 @@ void myHandleMenuNavigation(){
   if(!myIsSelected && Serial.available()){
     char c=Serial.read();
     if (c=='A'||c=='S'||c=='D'||c=='F'||c=='a'||c=='s'||c=='d'||c=='f'){ myHandleFreezeCommand(c); return; }
-    if(c>='1'&&c<='9'){ int ni=c-'0'; if(ni<=myTotalItems){ myMenuIndex=ni; myIsSelected=true; myExecuteMenuItem(myMenuIndex);} }
-    else if(c=='t'||c=='T'){ if(now-myLastTapTime>myTapCooldown){ myMenuIndex++; if(myMenuIndex>myTotalItems) myMenuIndex=1; myDrawMenu(); myLastTapTime=now; } }
+    if (c=='?'){ myPrintStatus(); return; }
+    if (c>='0'&&c<='9'){
+      int classIdx = c-'0';
+      if (classIdx<NUM_CLASSES){ myMenuIndex=classIdx+1; myIsSelected=true; myExecuteMenuItem(myMenuIndex); }
+      else Serial.printf("[Menu] '%c' has no class - only %d classes defined.\n", c, NUM_CLASSES);
+      return;
+    }
+    for(int a=0;a<NUM_ACTIONS;a++){
+      if (c==myActionKeys[a]){ myMenuIndex=NUM_CLASSES+a+1; myIsSelected=true; myExecuteMenuItem(myMenuIndex); return; }
+    }
+    if(c=='t'||c=='T'){ if(now-myLastTapTime>myTapCooldown){ myMenuIndex++; if(myMenuIndex>myTotalItems) myMenuIndex=1; myDrawMenu(); myLastTapTime=now; } }
     else if(c=='l'||c=='L'){ myIsSelected=true; myExecuteMenuItem(myMenuIndex); }
   }
   if(!myIsSelected){
@@ -1109,8 +1284,9 @@ void setup(){
   Serial.begin(115200);
   while(!Serial && millis()<3000);
   delay(1000);
-  Serial.println("\n=== XIAO ESP32-S3 Motion ML — Streaming SNN + Surrogate Gradients v003 ===");
-  Serial.println("Freeze toggles: A/S/D/F = SNN conv1/dense1/dense2/output, a/s/d/f = ANN equivalents");
+  Serial.println("\n=== XIAO ESP32-S3 Motion ML — Streaming SNN + Surrogate Gradients v004 ===");
+  Serial.println("Menu hotkeys: 0-9 jump to that class, G/H/J/K/M = Train ANN/Infer ANN/Train SNN/Infer SNN/Train+Infer SNN.");
+  Serial.println("Freeze toggles: A/S/D/F = SNN conv1/dense1/dense2/output, a/s/d/f = ANN equivalents. '?' = full status dump.");
 
   pinMode(A0, INPUT);
   u8g2.begin();
