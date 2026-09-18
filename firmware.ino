@@ -1,8 +1,72 @@
 // ======================================================
 // XIAO ML KIT (OR XIAO ESP32S3 SENSE)
-// FULL MOTION / IMU ML — STREAMING SNN + SURROGATE GRADIENTS — v004
+// FULL MOTION / IMU ML — STREAMING SNN + SURROGATE GRADIENTS — v012
 //
-// Changes from v003 (functionality identical — no model/algorithm
+// Changes from v008 (v009-v012 combined):
+//   - SNN letter-decision engine REDESIGNED. The old approach required
+//     WINDOW_TICKS (was LETTER_CONFIRM_TICKS) consecutive IDENTICAL raw
+//     predictions - true unanimity, reset to zero by a single disagreeing
+//     tick. It's replaced with a continuously-updated rolling top-3
+//     Borda-style vote: every tick, the top 3 classes by trace score get
+//     weighted votes (3/2/1), summed over a sliding window of the last
+//     WINDOW_TICKS ticks (old ticks age out of the ring automatically).
+//     The current leader only commits once it beats the runner-up by
+//     SNN_VOTE_MARGIN points - a near-tie just keeps waiting for more
+//     evidence rather than forcing a decision. This still allows
+//     "commit nothing" when the signal is genuinely ambiguous (unlike an
+//     elimination/last-standing scheme, which always produces some
+//     winner) - see myUpdateOutputStringSnn() and the comment block
+//     above it for the full reasoning.
+//   - Any commit (letter, Still, OR Delete) now clears the SNN vote
+//     window immediately (see myCommitClass()), so the tail of one
+//     gesture's votes can't bleed into and bias the next one.
+//   - NEW 'm' menu command: instantly reprints the menu with no SD
+//     access, as a fast alternative to '?' (which scans every class's
+//     sample count on SD and can feel slow just to get the menu back).
+//
+// ---- v008 changes from v005 (v006-v008 combined):
+//   - The air-writing output engine is now SHARED between both inference
+//     modes, not SNN-only. Windowed "Infer ANN" now also drives
+//     myOutputString, via its own per-window debounce (ANN_CONFIRM_WINDOWS,
+//     default 2) that's separate from the SNN's per-tick debounce
+//     (LETTER_CONFIRM_TICKS, default 6) - see myCommitClass() and the two
+//     debounce paths just above mySnnLoadSampleEncoded(). Both funnel into
+//     the same gLastCommittedClass edge-trigger, so switching between the
+//     two inference modes mid-line can't double-fire a held pose.
+//   - NEW gVerboseInfer toggle ('v'/'V' from the menu, default ON): OFF
+//     silences the per-tick/per-window debug trail (spike rates, raw/vote
+//     predictions, debug OLED screens) on BOTH inference modes, leaving
+//     only the output transcript on Serial and OLED - myOnOutputChanged()
+//     is deliberately NOT gated by this, since that's the one thing quiet
+//     mode is supposed to still show.
+//   - NEW myDrawOutputOLED(): word-wraps the tail of myOutputString across
+//     the 72x40 OLED (5 lines x ~13 chars) and is what the screen shows
+//     during quiet inference, refreshed every time the transcript changes.
+//   - LETTER_CONFIRM_TICKS and ANN_CONFIRM_WINDOWS are plain tunable
+//     constants (not magic numbers buried in logic) - raise either to
+//     require a longer clean run before a letter commits (safer, slower),
+//     lower to commit faster (snappier, more prone to a stray wrong
+//     letter). They're on very different timescales - 6 SNN ticks is
+//     ~150ms of continuous stream, 2 ANN windows is ~2s, since each ANN
+//     "window" is already itself a 3-window majority vote over ~1s.
+//
+// ---- v005 changes from v004 (functionality otherwise identical):
+//   - NEW: live "air-writing" output string. Continuous SNN inference
+//     (Infer SNN) now maintains myOutputString and prints it to Serial
+//     every time a class is confirmed:
+//       - "0Still"  -> appends a single space (never doubles up on an
+//                      existing trailing space, and never adds a
+//                      leading space to an empty string)
+//       - "1Delete" -> removes the last character
+//       - anything else -> appends that class's letter (the label with
+//                      its leading hotkey digit stripped, e.g. "2W"->"W")
+//     A prediction only "counts" once it's been stable for
+//     LETTER_CONFIRM_TICKS ticks in a row, and only fires once per
+//     stable stretch (edge-triggered), so holding a pose doesn't spam
+//     the same letter/space forever. See the new block just above
+//     mySnnLoadSampleEncoded() for the full mechanism.
+//
+// ---- v004 changes from v003 (functionality identical — no model/algorithm
 // changes — this pass only improves observability):
 //   - Serial output during "in-menu-item" screens (collect/train/infer)
 //     was sparse; every action now prints a header banner on entry,
@@ -126,8 +190,8 @@ U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
 // collected samples under the old name leaves those samples orphaned
 // under the old folder unless you rename that SD folder too.
 String myClassLabels[NUM_CLASSES] = {
-  "0Still", "1Punch", "2Wave", "3class", "4class",
-  "5class", "6class", "7class", "8class", "9class"
+  "0Still", "1Delete", "2W", "3O", "4R",
+  "5D", "6S", "7A", "8T", "9E"
 };
 static_assert(NUM_CLASSES <= 10, "Digit hotkeys only cover classes 0-9 - reduce NUM_CLASSES or extend the hotkey scheme.");
 
@@ -138,6 +202,210 @@ const char* myActionLabels[NUM_ACTIONS] = {
   "Train ANN", "Infer ANN", "Train SNN", "Infer SNN", "Train+Infer SNN"
 };
 const int myTotalItems = NUM_CLASSES + NUM_ACTIONS;
+
+// ======================================================
+// LIVE OUTPUT STRING — turns confirmed class predictions into a running
+// line of text. Shared by BOTH inference modes:
+//   - continuous "Infer SNN" gets a raw prediction every single tick
+//     (~25ms), so it needs its own tick-based debounce
+//   - windowed "Infer ANN" gets one (already 3-window-majority-voted)
+//     prediction per ~1s window, so it needs a separate, much shorter,
+//     window-based debounce
+// Both funnel into myCommitClass() below, which is what actually knows
+// about "Still"=space / "Delete"=backspace / anything else=append-letter,
+// and which shares gLastCommittedClass across the two modes so switching
+// between Infer SNN and Infer ANN mid-line can't double-fire the same
+// held pose as two separate letters.
+//
+// The letter/action for each class is just its label with the leading
+// hotkey digit stripped (myClassLabels[idx].substring(1)): "2W" -> "W",
+// "0Still" -> "Still", "1Delete" -> "Delete". Renaming a class's TEXT
+// still works automatically - only the "Still" and "Delete" strings
+// themselves are special-cased, so keep those two exact if you rename
+// slots later.
+// ======================================================
+String myOutputString = "";
+int gLastCommittedClass = -1;   // last class that actually produced an action (shared by both modes)
+
+// Verbose/quiet toggle for live inference. ON (default at boot) shows the
+// full per-tick/per-window debug trail (spike rates, raw/vote predictions,
+// OLED diagnostics) - useful while tuning. OFF keeps Serial/OLED down to
+// just the output transcript, which is what you want once it's working.
+// Toggle with 'v'/'V' from the menu (see myHandleMenuNavigation).
+bool gVerboseInfer = true;
+
+String myClassText(int idx){ return myClassLabels[idx].substring(1); }
+
+// Draws the current transcript, word-wrapped (most recent content first
+// if it's too long to fit), on the 72x40 OLED. This is what the screen
+// shows during quiet inference, and is refreshed every time the
+// transcript actually changes.
+void myDrawOutputOLED(){
+  const int charsPerLine = 13;   // ~5px/char at 5x7 font fits the 72px width
+  const int maxLines     = 5;    // y=7,15,23,31,39 fits the 40px height
+  String s = myOutputString;
+  int total = s.length();
+  int start = max(0, total - charsPerLine*maxLines);
+  u8g2.firstPage();
+  do{
+    u8g2.setFont(u8g2_font_5x7_tf);
+    if (total == 0) { u8g2.drawStr(0,7,"(empty)"); }
+    else {
+      int y=7;
+      for(int i=start; i<total && y<=39; i+=charsPerLine){
+        String line = s.substring(i, min(i+charsPerLine, total));
+        u8g2.drawStr(0,y,line.c_str());
+        y+=8;
+      }
+    }
+  } while(u8g2.nextPage());
+}
+
+// Called whenever myOutputString actually changes. Always prints the
+// full line to Serial (this is intentionally NOT gated by gVerboseInfer -
+// the whole point of quiet mode is that this is the only thing left) and
+// keeps the OLED transcript in sync.
+void myOnOutputChanged(){
+  Serial.println(myOutputString);
+  myDrawOutputOLED();
+}
+
+// ---- SNN path: continuous rolling top-3 vote over the last WINDOW_TICKS ticks ----
+//
+// Why not the old "N identical ticks in a row" streak? That's unanimity,
+// not the way a person actually tracks continuous motion - they hold a
+// running best-guess that firms up as consistent evidence arrives and
+// gets revised when it doesn't, rather than discarding all progress the
+// instant one tick disagrees. This replaces it with a rolling weighted
+// vote, re-evaluated every tick (not just once every WINDOW_TICKS ticks):
+//
+//   1) Each tick, take the SNN's full per-class trace (already computed
+//      by mySnnTick every tick) and rank the top 3 classes by score.
+//      Give them Borda-style weights (3/2/1 points for 1st/2nd/3rd).
+//   2) Keep a sliding window of the last WINDOW_TICKS ticks' weights,
+//      summed per class (a small ring buffer so old ticks age out
+//      automatically as new ones arrive - literally "reducing the best
+//      choice while the information is arriving").
+//   3) The current leader is whichever class has the highest windowed
+//      sum. It only commits if it leads the runner-up by at least
+//      SNN_VOTE_MARGIN points - if it's a near-tie, nothing commits and
+//      the window just keeps sliding, waiting for clearer evidence. This
+//      is what preserves "better no letter than the wrong letter": unlike
+//      an elimination/last-standing scheme, this can legitimately decide
+//      NOTHING for as long as the signal stays ambiguous.
+//
+// WINDOW_TICKS (still the same tunable you've been using, just renamed
+// for what it now means) controls how much evidence is gathered before a
+// decision is even possible - raise it for a steadier but slower
+// analysis, lower it for a snappier but noisier one.
+//
+// Any commit (letter, Still, or Delete - see myCommitClass below) clears
+// this window immediately, so the tail end of one gesture's votes can't
+// bleed into and bias the next one.
+#define SNN_VOTE_TOPK 3
+const int WINDOW_TICKS = 6;              // rolling window length, in ticks (~25ms/tick) - was LETTER_CONFIRM_TICKS
+const float SNN_VOTE_MARGIN = 4.0f;      // leader must beat the runner-up by this many points to commit (scale: a tick's full 1st-place vote = 3)
+float gVoteRing[WINDOW_TICKS][NUM_CLASSES];   // per-tick Borda contributions, circular
+float gVoteSum[NUM_CLASSES];                  // running sum across the current window
+int   gVoteRingPos  = 0;                      // next ring slot to overwrite
+int   gVoteRingFill = 0;                      // ticks accumulated so far this window (ramps 0..WINDOW_TICKS)
+void myResetOutputDebounceSnn(){
+  memset(gVoteRing, 0, sizeof(gVoteRing));
+  memset(gVoteSum, 0, sizeof(gVoteSum));
+  gVoteRingPos = 0; gVoteRingFill = 0;
+}
+
+// The actual action for a confirmed class, shared by both debounce paths
+// below. Edge-triggered on gLastCommittedClass so it only fires once per
+// stable stretch, however that stretch was confirmed. Also resets the SNN
+// voting window every time ANYTHING commits (letter, Still, or Delete) -
+// see the block above for why.
+void myCommitClass(int classIdx){
+  if (classIdx == gLastCommittedClass) return;
+  gLastCommittedClass = classIdx;
+  myResetOutputDebounceSnn();
+  String text = myClassText(classIdx);
+
+  if (text == "Still") {
+    if (myOutputString.length() > 0 && myOutputString.charAt(myOutputString.length()-1) != ' ') {
+      myOutputString += ' ';
+      myOnOutputChanged();
+    }
+  } else if (text == "Delete") {
+    if (myOutputString.length() > 0) {
+      myOutputString.remove(myOutputString.length()-1);
+      myOnOutputChanged();
+    }
+  } else {
+    myOutputString += text;
+    myOnOutputChanged();
+  }
+}
+
+// Call once per tick with a NUM_CLASSES-length score array (typically
+// gStreamTrace, with any inactive class pre-masked to a very negative
+// value by the caller - see myActionInferSnnContinuous). Deliberately
+// takes plain scores rather than checking gActiveClassMask itself: this
+// block sits near the top of the file (before variables/functions are
+// declared before use), while gActiveClassMask lives down in the SNN
+// section, so masking is the caller's job. Internally tracks the rolling
+// top-3 vote described above and calls myCommitClass() the moment a
+// leader clears the margin.
+void myUpdateOutputStringSnn(float* scores){
+  // 1) find this tick's top-3 classes by score
+  int   topIdx[SNN_VOTE_TOPK]   = {-1,-1,-1};
+  float topScore[SNN_VOTE_TOPK] = {-1e30f,-1e30f,-1e30f};
+  for(int c=0;c<NUM_CLASSES;c++){
+    float s = scores[c];
+    for(int k=0;k<SNN_VOTE_TOPK;k++){
+      if (s > topScore[k]){
+        for(int j=SNN_VOTE_TOPK-1;j>k;j--){ topScore[j]=topScore[j-1]; topIdx[j]=topIdx[j-1]; }
+        topScore[k]=s; topIdx[k]=c;
+        break;
+      }
+    }
+  }
+
+  // 2) slide the window: subtract the slot about to be overwritten, add this tick's weights
+  static const float kWeights[SNN_VOTE_TOPK] = {3.0f, 2.0f, 1.0f};
+  for(int c=0;c<NUM_CLASSES;c++) gVoteSum[c] -= gVoteRing[gVoteRingPos][c];
+  memset(gVoteRing[gVoteRingPos], 0, sizeof(float)*NUM_CLASSES);
+  for(int k=0;k<SNN_VOTE_TOPK;k++){
+    if (topIdx[k] < 0) continue;
+    gVoteRing[gVoteRingPos][topIdx[k]] = kWeights[k];
+    gVoteSum[topIdx[k]] += kWeights[k];
+  }
+  gVoteRingPos = (gVoteRingPos+1) % WINDOW_TICKS;
+  if (gVoteRingFill < WINDOW_TICKS) gVoteRingFill++;
+  if (gVoteRingFill < WINDOW_TICKS) return;   // window still filling for the first time (or just after a reset) - no decision yet
+
+  // 3) find the current leader and runner-up
+  int best=-1, second=-1;
+  for(int c=0;c<NUM_CLASSES;c++){
+    if (gVoteSum[c] <= 0) continue;
+    if (best==-1 || gVoteSum[c] > gVoteSum[best]) { second=best; best=c; }
+    else if (second==-1 || gVoteSum[c] > gVoteSum[second]) { second=c; }
+  }
+  if (best==-1) return;   // nothing has any votes at all - shouldn't happen once the window is full, but stay safe
+
+  // 4) only commit if the leader clearly beats the runner-up - a near-tie just keeps waiting
+  float margin = (second==-1) ? gVoteSum[best] : (gVoteSum[best]-gVoteSum[second]);
+  if (margin < SNN_VOTE_MARGIN) return;
+
+  myCommitClass(best);
+}
+
+// ---- ANN path: per-window debounce (windowed, already 3-window-voted inference) ----
+int gAnnPendingClass = -1, gAnnPendingWindows = 0;
+const int ANN_CONFIRM_WINDOWS = 2;  // fewer than WINDOW_TICKS since each "window" here is already a 3-window majority vote (~1s of data)
+void myResetOutputDebounceAnn(){ gAnnPendingClass=-1; gAnnPendingWindows=0; }
+// Call once per window with the ALREADY-VOTED finalPred from myActionInferAnn().
+void myUpdateOutputStringAnn(int finalPred){
+  if (finalPred == gAnnPendingClass) gAnnPendingWindows++;
+  else { gAnnPendingClass = finalPred; gAnnPendingWindows = 1; }
+  if (gAnnPendingWindows < ANN_CONFIRM_WINDOWS) return;
+  myCommitClass(gAnnPendingClass);
+}
 
 float LEARNING_RATE      = 0.001f;
 int   BATCH_SIZE         = 6;
@@ -659,8 +927,12 @@ void myActionTrainAnn(){
 void myActionInferAnn(){
   if(!gAnn.trained){ Serial.println("[ANN] No trained weights yet - run 'Train ANN' first."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No ANN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   Serial.println("\n--- Infer ANN (windowed, majority-vote over last 3 windows) ---");
+  Serial.printf("[ANN] Verbose inference output: %s (press 'v' from the menu to change before entering)\n", gVerboseInfer?"ON":"OFF");
   myRefreshActiveClassMask();
+  myResetOutputDebounceAnn();
+  Serial.printf("[ANN] Output so far: \"%s\"\n", myOutputString.c_str());
   Serial.println("Move the sensor. 3x TAP (or send 'l') to return to menu.");
+  if (!gVerboseInfer) myDrawOutputOLED();
   int windowCount=0, voteBuf[3]={0,0,0}, voteIdx=0, finalPred=0;
   while(true){
     if(myCheckTouchInput()==2){ Serial.printf("[ANN] Exiting after %d windows.\n", windowCount); myResetMenuState(); return; }
@@ -675,8 +947,11 @@ void myActionInferAnn(){
     windowCount++; voteBuf[voteIdx%3]=rawPred; voteIdx++;
     int votes[NUM_CLASSES]={}; for(int v=0;v<3;v++) votes[voteBuf[v]]++;
     { int best=voteBuf[0]; for(int v=1;v<3;v++) if(votes[voteBuf[v]]>votes[best]) best=voteBuf[v]; finalPred=best; }
-    Serial.printf("[ANN] #%d raw=%s vote=%s\n",windowCount,myClassLabels[rawPred].c_str(),myClassLabels[finalPred].c_str());
-    u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,"ANN:");u8g2.drawStr(0,18,myClassLabels[finalPred].c_str());}while(u8g2.nextPage());
+    myUpdateOutputStringAnn(finalPred);
+    if (gVerboseInfer) {
+      Serial.printf("[ANN] #%d raw=%s vote=%s\n",windowCount,myClassLabels[rawPred].c_str(),myClassLabels[finalPred].c_str());
+      u8g2.firstPage(); do{u8g2.setFont(u8g2_font_5x7_tf);u8g2.drawStr(0,8,"ANN:");u8g2.drawStr(0,18,myClassLabels[finalPred].c_str());}while(u8g2.nextPage());
+    }
   }
 }
 
@@ -1106,12 +1381,18 @@ void myActionTrainSnn(){
 // ======================================================
 // INFER SNN — continuous streaming classification, no windowing.
 // Reads the trace every tick and reports it; never waits for 40 samples.
+// Also feeds every raw prediction into myUpdateOutputStringSnn() to build
+// the live air-writing transcript (myOutputString).
 // ======================================================
 void myActionInferSnnContinuous(){
   if(!gSnn.trained){ Serial.println("[SNN] No trained weights yet - run 'Train SNN' or 'Train+Infer SNN' first."); u8g2.firstPage(); do{u8g2.drawStr(0,15,"No SNN weights");}while(u8g2.nextPage()); delay(1200); myResetMenuState(); return; }
   Serial.println("\n--- Infer SNN (continuous streaming, no windowing) ---");
+  Serial.printf("[SNN-live] Verbose inference output: %s (press 'v' from the menu to change before entering)\n", gVerboseInfer?"ON":"OFF");
   myRefreshActiveClassMask();
+  myResetOutputDebounceSnn();
+  Serial.printf("[SNN-live] Output so far: \"%s\"\n", myOutputString.c_str());
   Serial.println("Move the sensor. 3x TAP (or send 'l') to return to menu.");
+  if (!gVerboseInfer) myDrawOutputOLED();
   mySnnResetStreamState();
   float prevNorm[IMU_AXES]={0,0,0}; bool havePrev=false;
   unsigned long tickCount=0;
@@ -1135,16 +1416,24 @@ void myActionInferSnnContinuous(){
 
     int pred = mySnnTick(spikeTick, false, 0);
     tickCount++;
+    // Mask out inactive classes before handing scores to the vote engine, so an
+    // untrained/empty class can never win a tick's top-3 (myUpdateOutputStringSnn
+    // itself doesn't know about gActiveClassMask - see its comment for why).
+    float maskedScores[NUM_CLASSES];
+    for(int c=0;c<NUM_CLASSES;c++) maskedScores[c] = gActiveClassMask[c] ? gStreamTrace[c] : -1e30f;
+    myUpdateOutputStringSnn(maskedScores);
 
-    if (tickCount % 8 == 0) {   // ~every 200ms, to avoid flooding Serial/OLED
+    if (tickCount % 8 == 0) {   // ~every 200ms - rate tracking always runs, but the print/OLED below is debug-only
       float c1Rate=(gStreamConv1Spikes-prevC1)/8.0f, d1Rate=(gStreamDense1Spikes-prevD1)/8.0f, d2Rate=(gStreamDense2Spikes-prevD2)/8.0f;
       prevC1=gStreamConv1Spikes; prevD1=gStreamDense1Spikes; prevD2=gStreamDense2Spikes;
-      Serial.printf("[SNN-live] tick=%lu pred=%s  spikes/tick: c1=%.2f d1=%.2f d2=%.2f\n",
-                    tickCount, myClassLabels[pred].c_str(), c1Rate, d1Rate, d2Rate);
-      u8g2.firstPage();
-      do{ u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(0,8,"SNN live:"); u8g2.drawStr(0,18,myClassLabels[pred].c_str());
-          char b[20]; snprintf(b,20,"t=%lu",tickCount); u8g2.drawStr(0,28,b);
-          snprintf(b,20,"sp%.1f/%.1f/%.1f",c1Rate,d1Rate,d2Rate); u8g2.drawStr(0,38,b); } while(u8g2.nextPage());
+      if (gVerboseInfer) {
+        Serial.printf("[SNN-live] tick=%lu pred=%s  spikes/tick: c1=%.2f d1=%.2f d2=%.2f\n",
+                      tickCount, myClassLabels[pred].c_str(), c1Rate, d1Rate, d2Rate);
+        u8g2.firstPage();
+        do{ u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(0,8,"SNN live:"); u8g2.drawStr(0,18,myClassLabels[pred].c_str());
+            char b[20]; snprintf(b,20,"t=%lu",tickCount); u8g2.drawStr(0,28,b);
+            snprintf(b,20,"sp%.1f/%.1f/%.1f",c1Rate,d1Rate,d2Rate); u8g2.drawStr(0,38,b); } while(u8g2.nextPage());
+      }
     }
     long el=millis()-tS; if(el<SAMPLE_INTERVAL_MS) delay(SAMPLE_INTERVAL_MS-el);
   }
@@ -1264,6 +1553,8 @@ void myPrintStatus(){
                 LEARNING_RATE, BATCH_SIZE, TARGET_EPOCHS, VALIDATION_SAMPLES);
   Serial.printf("SNN tuning: LIF_THRESHOLD=%.2f LIF_LEAK=%.2f SNN_WEIGHT_SCALE=%.2f SNN_TRACE_LEAK=%.2f DELTA_THRESHOLD=[%.2f,%.2f,%.2f]\n",
                 LIF_THRESHOLD, LIF_LEAK, SNN_WEIGHT_SCALE, SNN_TRACE_LEAK, DELTA_THRESHOLD[0], DELTA_THRESHOLD[1], DELTA_THRESHOLD[2]);
+  Serial.printf("Air-writing output: \"%s\" (SNN window=%d ticks, margin=%.1f | ANN confirm=%d windows)\n",
+                myOutputString.c_str(), WINDOW_TICKS, SNN_VOTE_MARGIN, ANN_CONFIRM_WINDOWS);
   Serial.printf("SD card: %s | Free PSRAM: %d bytes | Uptime: %lus\n",
                 mySDavailable?"present":"absent", ESP.getFreePsram(), millis()/1000);
   Serial.println("==============");
@@ -1278,7 +1569,7 @@ void myDrawMenu(){
   Serial.println("\n=== MENU ===");
   for(int i=1;i<=myTotalItems;i++) Serial.printf("%s%c. %s\n",(i==myMenuIndex)?" > ":"   ",myMenuHotkey(i),myMenuLabel(i).c_str());
   Serial.println("Hotkeys: 0-9=jump to that class (grows with NUM_CLASSES), G/H/J/K/M=Train ANN/Infer ANN/Train SNN/Infer SNN/Train+Infer SNN");
-  Serial.println("Freeze: A/S/D/F=SNN conv1/d1/d2/out  a/s/d/f=ANN conv1/d1/d2/out  ?=status  t=tap-advance  l=select/exit");
+  Serial.println("Freeze: A/S/D/F=SNN conv1/d1/d2/out  a/s/d/f=ANN conv1/d1/d2/out  ?=status  v=verbose toggle  m=reprint menu  t=tap-advance  l=select/exit");
   u8g2.firstPage();
   do{
     // 5x7 keeps this within the 72px-wide panel; the old 6x10 "TAP:Next
@@ -1306,6 +1597,8 @@ void myHandleMenuNavigation(){
     char c=Serial.read();
     if (c=='A'||c=='S'||c=='D'||c=='F'||c=='a'||c=='s'||c=='d'||c=='f'){ myHandleFreezeCommand(c); return; }
     if (c=='?'){ myPrintStatus(); return; }
+    if (c=='v'||c=='V'){ gVerboseInfer=!gVerboseInfer; Serial.printf("Verbose inference output=%d (%s)\n", gVerboseInfer, gVerboseInfer?"debug trail ON":"quiet - transcript only"); return; }
+    if (c=='m'){ myDrawMenu(); return; }   // fast reprint - no SD scanning, unlike '?' (see myPrintStatus)
     if (c>='0'&&c<='9'){
       int classIdx = c-'0';
       if (classIdx<NUM_CLASSES){ myMenuIndex=classIdx+1; myIsSelected=true; myExecuteMenuItem(myMenuIndex); }
@@ -1332,9 +1625,9 @@ void setup(){
   Serial.begin(115200);
   while(!Serial && millis()<3000);
   delay(1000);
-  Serial.println("\n=== XIAO ESP32-S3 Motion ML — Streaming SNN + Surrogate Gradients v004 ===");
+  Serial.println("\n=== XIAO ESP32-S3 Motion ML — Streaming SNN + Surrogate Gradients v012 ===");
   Serial.println("Menu hotkeys: 0-9 jump to that class, G/H/J/K/M = Train ANN/Infer ANN/Train SNN/Infer SNN/Train+Infer SNN.");
-  Serial.println("Freeze toggles: A/S/D/F = SNN conv1/dense1/dense2/output, a/s/d/f = ANN equivalents. '?' = full status dump.");
+  Serial.println("Freeze toggles: A/S/D/F = SNN conv1/dense1/dense2/output, a/s/d/f = ANN equivalents. '?' = full status dump (slow - scans SD). 'v' = toggle verbose inference output. 'm' = instantly reprint the menu.");
 
   pinMode(A0, INPUT);
   u8g2.begin();
