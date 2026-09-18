@@ -1,5 +1,10 @@
 
 
+# Releases
+
+Sept 18, 2026 Made firmware.ino using 10 classes (from 1 to 10)   imu-snn-v012.ino
+
+
 Sept 17 2026  firmware uses the 3 class  imu-snn-v006.ino
 
 
