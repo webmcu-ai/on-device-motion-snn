@@ -11,6 +11,8 @@ Demo Cell phone IMU webpage here when ready  https://webmcu-ai.github.io/on-devi
 ## Probably a good idea to check with an AI if this has any damaging code in the index.html file.
 
 
+Note the inference "STOP" button is way below the rest of the page. (Took a while to find it)
+
 <img src="backups/cell-webpage.jpg" width=500>
 
 
