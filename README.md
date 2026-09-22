@@ -2,7 +2,13 @@
 spiking neural network testing
 
 
+Claude made this. It is very cool, but wants access to a folder on your cell phone to save the motion data and the binary for the on-device model
+
+Not even sure if I am OK doing this, but it is cool.
+
 Demo Cell phone IMU webpage here when ready  https://webmcu-ai.github.io/on-device-motion-snn/index.html
+
+## Probably a good idea to check with an AI if this has any damaging code in the index.html file.
 
 
 This is all part of my on-device and webAI Github Organization at   https://github.com/webmcu-ai
