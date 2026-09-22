@@ -2,6 +2,9 @@
 spiking neural network testing
 
 
+Demo Cell phone IMU webpage here when ready  https://webmcu-ai.github.io/on-device-motion-snn/index.html
+
+
 This is all part of my on-device and webAI Github Organization at   https://github.com/webmcu-ai
 
 
