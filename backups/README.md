@@ -2,6 +2,10 @@
 
 # Releases
 
+Sept 22, 2026  Firmware.ino based on imu-snn-v022.ino
+
+index.html based on index-v023.html
+
 Sept 18, 2026 Made firmware.ino using 10 classes (from 1 to 10)   imu-snn-v012.ino
 
 
