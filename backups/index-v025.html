@@ -1,0 +1,1944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IMU Air-Writing Trainer (browser, v024)</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<!--
+======================================================================
+IMU AIR-WRITING TRAINER - BROWSER EDITION
+index-v024.html
+
+WHAT'S NEW IN v024
+  The SNN's output engine no longer commits from a fixed sliding window.
+  It now mirrors the device's gesture segmentation: draw a letter, pause,
+  and only then does it commit - see OUTPUT ENGINE / gestureTick() below.
+  "Still" (space) is now a timeout on sustained stillness rather than a
+  class the SNN has to recognise mid-gesture. Also fixed a zip-import crash
+  on folder entries, added a way to delete a single collected rep, and
+  choosing a real folder now auto-loads any ANN/SNN weights and calibration
+  already in its header/ subfolder.
+
+WHAT IT DOES
+  Runs the same two classifiers as the on-device firmware (imu-snn-v024.ino)
+  directly in a phone's browser, using the phone's own accelerometer instead
+  of the XIAO ESP32S3's IMU. Training on a phone's CPU is much faster than
+  the microcontroller, and there's no SD card or Serial Monitor to fuss with.
+
+  ANN  Windowed Conv1D + Dense network, ordinary backprop + Adam.
+  SNN  Streaming spiking network (LIF neurons), surrogate-gradient BPTT.
+
+  Both are hand-ported from the C++ firmware line-for-line (not a generic
+  ML framework like TensorFlow.js/Transformers.js) so that:
+    (a) the WEIGHT FILES are byte-for-byte identical to what the device
+        reads/writes - "Download ANN weights" produces a myAnnWeights.bin
+        you can drop straight onto the SD card's /header/ folder, and vice
+        versa via "Upload ANN weights". Same for the SNN's
+        mySnnWeightsV15.bin.
+    (b) the architecture, training math, and output engine (Still/Delete/
+        letter commit logic and gesture segmentation) behave identically
+        to the device, so a model trained here predicts the same way there.
+  A generic framework would fight both of these - this custom architecture
+  has no ready-made equivalent, and even if it did, its weight format
+  would not match the device's raw float32 layout.
+
+HOW DATA IS STORED
+  Chrome/Edge on Android can grant this page a REAL folder via the File
+  System Access API ("Choose Folder") - it then writes motion/<class>/sN.csv
+  and header/*.bin exactly like the device writes to its SD card, using the
+  SAME folder and file names, so the two are drop-in interchangeable.
+  iOS Safari (and any browser without that API) has no such folder access,
+  so this page falls back to storing everything in the browser's own
+  IndexedDB. Use "Export All (.zip)" to get a real zip file (with the same
+  motion/... and header/... paths inside) you can save, move to a computer,
+  and copy onto the SD card - or "Import (.zip)" to load one back in.
+  "Download/Upload ANN|SNN weights" grab just the one binary file, for
+  quickly moving a trained model between the phone and the device.
+
+USING IT
+  1. "Enable Motion Sensors" (iOS asks for a one-time permission).
+  2. "Calibrate" - hold the phone still for ~2 seconds.
+  3. Tap a class button (or Still / Delete) to collect gestures for it.
+  4. Train ANN and/or Train SNN. AutoTrain repeats until you hit Stop,
+     saving after every loop, same as the device.
+  5. Infer ANN / Infer SNN to try it live - the transcript fills in below.
+  6. Download the weights and copy them onto the device's SD card, or
+     keep training/using the model right here in the browser.
+
+IMPORTANT: motion sensors require a secure context. Open this page over
+HTTPS (e.g. hosted on GitHub Pages) or from localhost - a plain file://
+double-click will not be allowed to read the accelerometer on most phones.
+
+By Jeremy Ellis, with Claude's help porting the C++ math to JavaScript.
+Use at your own risk! MIT license.
+======================================================================
+-->
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222c; --text:#e8eaf0; --muted:#9aa3b2;
+    --accent:#4f8cff; --accent2:#2ecc71; --danger:#e74c3c; --warn:#f39c12; --border:#2a2f3a;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+    transition: background-color 0.15s ease;
+  }
+  /* Data-collection cue: amber while getting ready, green while actually recording. */
+  body.collect-ready{ background-color:var(--warn); }
+  body.collect-recording{ background-color:var(--accent2); }
+  #app{max-width:640px; margin:0 auto; padding:12px 12px 90px 12px;}
+  h1{font-size:1.15rem; margin:8px 0 2px 0;}
+  h2{font-size:0.95rem; margin:0 0 8px 0; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;}
+  p.small, .small{color:var(--muted); font-size:0.82rem; line-height:1.35;}
+  .card{background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:12px; margin-bottom:12px;}
+  .row{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(64px,1fr)); gap:8px;}
+  button, .btn{
+    background:var(--panel2); color:var(--text); border:1px solid var(--border);
+    border-radius:10px; padding:10px 12px; font-size:0.95rem; cursor:pointer;
+    min-height:44px; touch-action:manipulation;
+  }
+  button:active{transform:scale(0.97);}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
+  button.good{background:var(--accent2); border-color:var(--accent2); color:#04240f;}
+  button.warn{background:var(--warn); border-color:var(--warn); color:#2b1900;}
+  button.danger{background:var(--danger); border-color:var(--danger); color:#fff;}
+  button:disabled{opacity:0.4; cursor:not-allowed;}
+  .classBtn{position:relative; font-weight:600;}
+  .classBtn .count{
+    position:absolute; top:-6px; right:-6px; background:var(--accent);
+    color:#fff; border-radius:999px; font-size:0.65rem; padding:1px 5px; min-width:16px; text-align:center;
+  }
+  .classBtn.empty .count{background:#555;}
+  textarea{
+    width:100%; background:#0b0d12; color:#cde; border:1px solid var(--border); border-radius:10px;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:0.8rem; padding:8px;
+  }
+  #transcript{height:72px; font-size:1.1rem; color:#fff; resize:vertical;}
+  #console{height:150px; resize:vertical;}
+  label{font-size:0.85rem; display:flex; align-items:center; gap:6px;}
+  input[type=number]{width:80px; background:#0b0d12; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px;}
+  select{background:#0b0d12; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px;}
+  .settingsGrid{display:grid; grid-template-columns:1fr auto; gap:6px 12px; align-items:center;}
+  .badge{display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.72rem; background:var(--panel2); border:1px solid var(--border);}
+  .ok{color:var(--accent2);} .bad{color:var(--danger);} .mid{color:var(--warn);}
+  #stopBar{
+    position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px)) 12px;
+    background:linear-gradient(180deg, transparent, var(--bg) 30%); display:none; z-index:50;
+  }
+  #stopBar.show{display:block;}
+  #stopBar button{width:100%; font-size:1.05rem; padding:14px;}
+  progress{width:100%; height:10px; accent-color:var(--accent);}
+  hr{border:none; border-top:1px solid var(--border); margin:10px 0;}
+  .hidden{display:none !important;}
+  #plotlyDiv{width:100%; min-height:200px;}
+  input[type=file]{font-size:0.8rem;}
+  details summary{cursor:pointer; color:var(--muted); font-size:0.9rem; padding:4px 0;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <h1>IMU Air-Writing Trainer <span class="small">- browser edition, v024</span></h1>
+  <p class="small">Companion to <b>imu-snn-v024.ino</b>. Trains the same ANN/SNN models on this phone's
+  accelerometer; weight files are byte-compatible with the on-device firmware. Requires HTTPS (or
+  localhost) for motion sensor access.</p>
+
+  <div class="card" id="setupCard">
+    <h2>Setup</h2>
+    <div class="row">
+      <button id="btnEnableMotion" class="primary">Enable Motion Sensors</button>
+      <button id="btnCalibrate" disabled>Calibrate</button>
+    </div>
+    <p class="small" id="motionStatus">Motion sensors: <span class="bad">not enabled</span></p>
+    <hr>
+    <div class="row">
+      <button id="btnChooseFolder">Choose Real Folder&hellip;</button>
+      <button id="btnExportZip">Export All (.zip)</button>
+      <label class="btn" for="fileImportZip" style="display:inline-flex;">Import (.zip)</label>
+      <input type="file" id="fileImportZip" accept=".zip" class="hidden">
+    </div>
+    <p class="small" id="storageStatus">Storage: <span class="mid">in-browser (IndexedDB)</span> - use Export to get real files.</p>
+  </div>
+
+  <div class="card">
+    <h2>Transcript</h2>
+    <textarea id="transcript" readonly placeholder="Air-written text appears here during Infer ANN / Infer SNN&hellip;"></textarea>
+    <div class="row" style="margin-top:6px;">
+      <button id="btnClearTranscript">Clear Transcript</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Classes <span class="small">(tap to collect gestures)</span></h2>
+    <div class="grid" id="classGrid"></div>
+  </div>
+
+  <div class="card hidden" id="collectPanel">
+    <h2 id="collectTitle">Collect</h2>
+    <p class="small" id="collectCount"></p>
+    <div class="row">
+      <button id="btnCaptureOne" class="primary">Capture 1</button>
+      <button id="btnAutoCollect" class="good">Auto x10</button>
+      <label class="btn" for="fileImportCsv" style="display:inline-flex;">Import CSVs&hellip;</label>
+      <input type="file" id="fileImportCsv" accept=".csv" multiple class="hidden">
+      <button id="btnCloseCollect">Close</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Train &amp; Infer</h2>
+    <div class="row">
+      <button id="btnTrainAnn">Train ANN</button>
+      <button id="btnInferAnn">Infer ANN</button>
+      <button id="btnTrainSnn">Train SNN</button>
+      <button id="btnInferSnn">Infer SNN</button>
+      <button id="btnTrainInferSnn">Train+Infer SNN</button>
+      <button id="btnAutoTrainAnn" class="warn">AutoTrain ANN</button>
+      <button id="btnAutoTrainSnn" class="warn">AutoTrain SNN</button>
+    </div>
+    <div id="progressWrap" class="hidden" style="margin-top:8px;">
+      <p class="small" id="progressLabel"></p>
+      <progress id="progressBar" value="0" max="1"></progress>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label><input type="checkbox" id="chkVerbose" checked> Verbose logging</label>
+      <button id="btnStatus">Status</button>
+    </div>
+  </div>
+
+  <details class="card">
+    <summary>Model file transfer (to/from the device's SD card)</summary>
+    <div class="row" style="margin-top:8px;">
+      <button id="btnDownloadAnn">Download ANN weights</button>
+      <label class="btn" for="fileUploadAnn" style="display:inline-flex;">Upload ANN weights&hellip;</label>
+      <input type="file" id="fileUploadAnn" accept=".bin" class="hidden">
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button id="btnDownloadSnn">Download SNN weights</button>
+      <label class="btn" for="fileUploadSnn" style="display:inline-flex;">Upload SNN weights&hellip;</label>
+      <input type="file" id="fileUploadSnn" accept=".bin" class="hidden">
+    </div>
+    <p class="small">Filenames match the device exactly: myAnnWeights.bin and mySnnWeightsV15.bin,
+    normally found in the SD card's /header/ folder.</p>
+  </details>
+
+  <details class="card">
+    <summary>Freeze layers &amp; tunables</summary>
+    <div style="margin-top:8px;">
+      <p class="small"><b>SNN freeze</b></p>
+      <div class="row">
+        <label><input type="checkbox" id="frzSnnC1"> conv1</label>
+        <label><input type="checkbox" id="frzSnnD1"> dense1</label>
+        <label><input type="checkbox" id="frzSnnD2"> dense2</label>
+        <label><input type="checkbox" id="frzSnnOut"> output</label>
+      </div>
+      <p class="small" style="margin-top:8px;"><b>ANN freeze</b></p>
+      <div class="row">
+        <label><input type="checkbox" id="frzAnnC1"> conv1</label>
+        <label><input type="checkbox" id="frzAnnD1"> dense1</label>
+        <label><input type="checkbox" id="frzAnnD2"> dense2</label>
+        <label><input type="checkbox" id="frzAnnOut"> output</label>
+      </div>
+      <hr>
+      <div class="settingsGrid" id="settingsGrid"></div>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>View collected data (Plotly)</summary>
+    <div class="row" style="margin-top:8px;">
+      <select id="viewClassSelect"></select>
+      <select id="viewRepSelect"></select>
+      <button id="btnRenderPlot">Render</button>
+      <button id="btnDeleteRep" class="danger" disabled>Delete Selected</button>
+    </div>
+    <div id="plotlyDiv"></div>
+  </details>
+
+  <div class="card">
+    <h2>Console</h2>
+    <textarea id="console" readonly></textarea>
+  </div>
+
+</div>
+
+<div id="stopBar"><button id="btnStop" class="danger">STOP</button></div>
+
+<script>
+'use strict';
+
+// ======================================================================
+// CONFIG - mirrors the CONFIGURATION section of imu-snn-v024.ino
+// ======================================================================
+const CLASSES = [
+  { label:"Still",  folder:"0Still"  },
+  { label:"Delete", folder:"1Delete" },
+  { label:"W",      folder:"2W"      },
+  { label:"O",      folder:"3O"      },
+  { label:"R",      folder:"4R"      },
+  { label:"D",      folder:"5D"      },
+  { label:"S",      folder:"6S"      },
+  { label:"A",      folder:"7A"      },
+  { label:"T",      folder:"8T"      },
+  { label:"E",      folder:"9E"      },
+];
+const NUM_CLASSES = CLASSES.length;
+const STILL_CLASS_IDX = CLASSES.findIndex(c=>c.label==='Still'); // -1 if no such class
+
+const IMU_TIMESTEPS = 40;
+const IMU_AXES = 3;
+const SAMPLE_INTERVAL_MS = 25;
+const SNN_CHANNELS = IMU_AXES*2+1;   // 7
+const SNN_IDLE_CH = IMU_AXES*2;      // 6
+
+const CONV1_KERNEL = 5;
+const CONV1_FILTERS = 8;
+const CONV1_OUT_STEPS = IMU_TIMESTEPS - CONV1_KERNEL + 1; // 36
+const POOL1_STEPS = Math.floor(CONV1_OUT_STEPS/2);        // 18
+const CONV1_FLAT = POOL1_STEPS*CONV1_FILTERS;             // 144 (ANN only)
+
+const DENSE1_SIZE = 32;
+const DENSE2_SIZE = 16;
+const DENSE2_WEIGHTS = DENSE1_SIZE*DENSE2_SIZE;   // 512
+const OUTPUT_WEIGHTS = DENSE2_SIZE*NUM_CLASSES;   // 160
+
+const CONV1_WEIGHTS_ANN = CONV1_KERNEL*IMU_AXES*CONV1_FILTERS;   // 120
+const DENSE1_WEIGHTS_ANN = CONV1_FLAT*DENSE1_SIZE;               // 4608
+const CONV1_WEIGHTS_SNN = CONV1_KERNEL*SNN_CHANNELS*CONV1_FILTERS; // 280
+const DENSE1_WEIGHTS_SNN = CONV1_FILTERS*DENSE1_SIZE;             // 256
+
+// Tunables (editable in the "Freeze layers & tunables" panel) - same defaults as the device.
+let LEARNING_RATE = 0.002;
+let BATCH_SIZE = 6;
+let TARGET_EPOCHS = 40;
+let VALIDATION_SAMPLES = 3;
+
+let SPIKE_DELTA_G = 0.03;
+let LIF_LEAK = 0.90;
+let LIF_THRESHOLD = 0.50;
+let SNN_TRACE_LEAK = 0.95;
+const SURROGATE_K = 10.0;
+
+const TRAIN_LOSS_FROM_TICK = 16;
+const AUG_MAX_SHIFT = 4;
+const AUG_GAIN_RANGE = 0.15;
+
+// SNN output engine: gesture segmentation (mirrors GESTURE_* in the firmware).
+// The SNN predicts every tick, but nothing is typed until a full gesture -
+// movement, then stillness - has been seen. See gestureTick()/classifyGesture().
+let GESTURE_ONSET_TICKS = 3;      // consecutive moving ticks before a gesture is considered STARTED
+let GESTURE_END_STILL_TICKS = 8;  // consecutive still ticks before a gesture is considered FINISHED
+let MIN_GESTURE_TICKS = 12;       // gestures shorter than this are ignored as noise, not a letter
+let MAX_GESTURE_TICKS = 120;      // safety cap: forces classification even if stillness never comes
+let FINAL_PORTION_TICKS = 10;     // how many of the most recent ticks count as the "final portion"
+let GESTURE_FINAL_WEIGHT = 0.5;   // blend: 0 = whole-gesture average only, 1 = final portion only
+let RESET_SETTLE_TICKS = 3;       // ticks ignored right after a commit while the SNN reset settles
+let GESTURE_COMMIT_MIN_PROB = 0.45; // the whole-gesture leader's blended score must be at least this
+let GESTURE_COMMIT_MARGIN = 0.15;   // ...and beat the runner-up by this much
+let STILL_HOLD_TICKS = 40;        // ticks of continued stillness (after any letter) before a space is typed
+let DELETE_REPEAT_MS = 800;
+let ANN_COMMIT_MIN_PROB = 0.50;
+let ANN_CONFIRM_WINDOWS = 1;
+
+const G_MS2 = 9.80665; // m/s^2 per g - phone accel is m/s^2, device readFloatAccel*() is in g
+
+const ANN_WEIGHT_FILE = 'myAnnWeights.bin';
+const SNN_WEIGHT_FILE = 'mySnnWeightsV15.bin';
+const CALIB_FILE = 'myCalib.bin';
+
+let verboseInfer = true;
+let stopRequested = false;
+let myAccelMean = [0,0,1], myAccelStd = [1,1,1];
+let activeClassMask = new Array(NUM_CLASSES).fill(true);
+let classEverTrained = new Array(NUM_CLASSES).fill(false);
+
+// ======================================================================
+// TINY LOGGER / UI HELPERS
+// ======================================================================
+function log(msg){
+  const el = document.getElementById('console');
+  el.value += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function setBusy(isBusy){
+  document.getElementById('stopBar').classList.toggle('show', isBusy);
+  document.querySelectorAll('#classGrid button, #collectPanel button, .card button, details button')
+    .forEach(b=>{ if (b.id!=='btnStop') b.disabled = isBusy; });
+}
+function showProgress(show){ document.getElementById('progressWrap').classList.toggle('hidden', !show); }
+function updateTrainProgress(epoch, total, trainAcc, valAcc){
+  showProgress(true);
+  document.getElementById('progressBar').value = epoch/total;
+  document.getElementById('progressLabel').textContent =
+    `Epoch ${epoch}/${total}  Train ${trainAcc.toFixed(1)}%  Val ${valAcc.toFixed(1)}%`;
+}
+
+// ======================================================================
+// STORAGE LAYER - File System Access API (Android Chrome) with an
+// IndexedDB fallback (iOS Safari and anything without that API).
+// Paths mirror the device's SD card exactly: motion/<folder>/sN.csv and
+// header/<name>.bin
+// ======================================================================
+let _idbPromise = null;
+function idbOpen(){
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve,reject)=>{
+    const req = indexedDB.open('imuWebTrainer', 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore('kv'); };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+  return _idbPromise;
+}
+async function idbGet(key){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readonly');
+    const rq = tx.objectStore('kv').get(key);
+    rq.onsuccess=()=>resolve(rq.result);
+    rq.onerror=()=>reject(rq.error);
+  });
+}
+async function idbSet(key,val){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readwrite');
+    tx.objectStore('kv').put(val,key);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  });
+}
+async function idbDelete(key){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readwrite');
+    tx.objectStore('kv').delete(key);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  });
+}
+async function idbKeys(prefix){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readonly');
+    const rq = tx.objectStore('kv').getAllKeys();
+    rq.onsuccess=()=>resolve(rq.result.filter(k=>typeof k==='string' && k.startsWith(prefix)));
+    rq.onerror=()=>reject(rq.error);
+  });
+}
+
+const Store = {
+  mode: 'idb',
+  rootHandle: null,
+
+  supportsFolder(){ return 'showDirectoryPicker' in window; },
+
+  async init(){
+    if (this.supportsFolder()){
+      try {
+        const saved = await idbGet('__fsRootHandle');
+        if (saved && saved.queryPermission){
+          const perm = await saved.queryPermission({mode:'readwrite'});
+          if (perm === 'granted'){ this.rootHandle = saved; this.mode = 'fs'; }
+        }
+      } catch(e){ /* ignore - fall back to idb */ }
+    }
+    this._reflectStatus();
+  },
+
+  async chooseFolder(){
+    if (!this.supportsFolder()){
+      alert("This browser can't grant a real folder (common on iPhone/iPad Safari). "+
+            "Using in-browser storage instead - use Export to get real files you can move to the SD card.");
+      return false;
+    }
+    try {
+      const handle = await window.showDirectoryPicker({ id:'imu-motion-data', mode:'readwrite' });
+      this.rootHandle = handle; this.mode = 'fs';
+      await idbSet('__fsRootHandle', handle);
+      this._reflectStatus();
+      log('Folder selected: '+handle.name);
+      return true;
+    } catch(e){ log('Folder selection cancelled.'); return false; }
+  },
+
+  _reflectStatus(){
+    const el = document.getElementById('storageStatus');
+    if (this.mode==='fs' && this.rootHandle){
+      el.innerHTML = 'Storage: <span class="ok">real folder ('+this.rootHandle.name+')</span>';
+    } else {
+      el.innerHTML = 'Storage: <span class="mid">in-browser (IndexedDB)</span> - use Export to get real files.';
+    }
+  },
+
+  async _classDir(classIdx, create){
+    const folder = CLASSES[classIdx].folder;
+    const motion = await this.rootHandle.getDirectoryHandle('motion', {create});
+    return motion.getDirectoryHandle(folder, {create});
+  },
+
+  async countSamples(classIdx){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const dir = await this._classDir(classIdx, false);
+        let n=0;
+        for await (const [name] of dir.entries()) if (name.endsWith('.csv')) n++;
+        return n;
+      } catch(e){ return 0; }
+    } else {
+      const prefix = 'motion/'+CLASSES[classIdx].folder+'/';
+      const keys = await idbKeys(prefix);
+      return keys.filter(k=>k.endsWith('.csv')).length;
+    }
+  },
+
+  async captureSample(classIdx, csvText){
+    const n = await this.countSamples(classIdx);
+    const name = 's'+n+'.csv';
+    if (this.mode==='fs' && this.rootHandle){
+      const dir = await this._classDir(classIdx, true);
+      const fh = await dir.getFileHandle(name, {create:true});
+      const w = await fh.createWritable();
+      await w.write(csvText);
+      await w.close();
+    } else {
+      await idbSet('motion/'+CLASSES[classIdx].folder+'/'+name, csvText);
+    }
+    return name;
+  },
+
+  async listSamples(classIdx){
+    let items = [];
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const dir = await this._classDir(classIdx, false);
+        for await (const [name, h] of dir.entries()){
+          if (!name.endsWith('.csv')) continue;
+          const file = await h.getFile();
+          items.push({ name, text: await file.text() });
+        }
+      } catch(e){ /* folder doesn't exist yet */ }
+    } else {
+      const prefix = 'motion/'+CLASSES[classIdx].folder+'/';
+      const keys = await idbKeys(prefix);
+      for (const k of keys){
+        const text = await idbGet(k);
+        items.push({ name:k.substring(prefix.length), text });
+      }
+    }
+    items.sort((a,b)=>(parseInt(a.name.replace(/\D/g,''))||0) - (parseInt(b.name.replace(/\D/g,''))||0));
+    return items;
+  },
+
+  // Removes one sample and renumbers the rest (s0.csv, s1.csv, ...) so a later
+  // capture - which always names itself by the current count - can never
+  // collide with a higher-numbered file left behind by the deletion.
+  async deleteSample(classIdx, name){
+    if (this.mode==='fs' && this.rootHandle){
+      const dir = await this._classDir(classIdx, false);
+      const remaining = (await this.listSamples(classIdx)).filter(it=>it.name!==name);
+      await dir.removeEntry(name);
+      for (const it of remaining) await dir.removeEntry(it.name);
+      for (let i=0;i<remaining.length;i++){
+        const fh = await dir.getFileHandle('s'+i+'.csv', {create:true});
+        const w = await fh.createWritable();
+        await w.write(remaining[i].text);
+        await w.close();
+      }
+    } else {
+      const prefix = 'motion/'+CLASSES[classIdx].folder+'/';
+      const remaining = (await this.listSamples(classIdx)).filter(it=>it.name!==name);
+      await idbDelete(prefix+name);
+      for (const it of remaining) await idbDelete(prefix+it.name);
+      for (let i=0;i<remaining.length;i++) await idbSet(prefix+'s'+i+'.csv', remaining[i].text);
+    }
+  },
+
+  async writeWeightFile(name, arrayBuffer){
+    if (this.mode==='fs' && this.rootHandle){
+      const hdr = await this.rootHandle.getDirectoryHandle('header', {create:true});
+      const fh = await hdr.getFileHandle(name, {create:true});
+      const w = await fh.createWritable();
+      await w.write(arrayBuffer);
+      await w.close();
+    } else {
+      await idbSet('header/'+name, arrayBuffer);
+    }
+  },
+
+  async readWeightFile(name){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const hdr = await this.rootHandle.getDirectoryHandle('header', {create:false});
+        const fh = await hdr.getFileHandle(name, {create:false});
+        const file = await fh.getFile();
+        return await file.arrayBuffer();
+      } catch(e){ return null; }
+    } else {
+      const buf = await idbGet('header/'+name);
+      return buf || null;
+    }
+  },
+};
+
+// ---- Minimal ZIP writer (STORE method - no compression - keeps this small) ----
+function crc32(bytes){
+  if (!crc32.table){
+    const t = new Uint32Array(256);
+    for (let n=0;n<256;n++){
+      let c=n;
+      for (let k=0;k<8;k++) c = (c&1) ? (0xEDB88320 ^ (c>>>1)) : (c>>>1);
+      t[n]=c>>>0;
+    }
+    crc32.table = t;
+  }
+  let crc = 0^(-1);
+  for (let i=0;i<bytes.length;i++) crc = (crc>>>8) ^ crc32.table[(crc^bytes[i])&0xFF];
+  return (crc^(-1))>>>0;
+}
+function makeZip(entries /* [{name, data:Uint8Array}] */){
+  const enc = new TextEncoder();
+  const localParts = [], centralParts = [];
+  let offset = 0;
+  for (const {name, data} of entries){
+    const nameBytes = enc.encode(name);
+    const crc = crc32(data);
+    const size = data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true); lh.setUint16(6,0,true);
+    lh.setUint16(8,0,true); lh.setUint16(10,0,true); lh.setUint16(12,0,true);
+    lh.setUint32(14,crc,true); lh.setUint32(18,size,true); lh.setUint32(22,size,true);
+    lh.setUint16(26,nameBytes.length,true); lh.setUint16(28,0,true);
+    localParts.push(new Uint8Array(lh.buffer), nameBytes, data);
+    const localSize = 30+nameBytes.length+size;
+
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true);
+    ch.setUint16(8,0,true); ch.setUint16(10,0,true); ch.setUint16(12,0,true); ch.setUint16(14,0,true);
+    ch.setUint32(16,crc,true); ch.setUint32(20,size,true); ch.setUint32(24,size,true);
+    ch.setUint16(28,nameBytes.length,true); ch.setUint16(30,0,true); ch.setUint16(32,0,true);
+    ch.setUint16(34,0,true); ch.setUint16(36,0,true); ch.setUint32(38,0,true);
+    ch.setUint32(42,offset,true);
+    centralParts.push(new Uint8Array(ch.buffer), nameBytes);
+
+    offset += localSize;
+  }
+  const centralStart = offset;
+  let centralSize = 0; for (const p of centralParts) centralSize += p.length;
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0,0x06054b50,true); eocd.setUint16(4,0,true); eocd.setUint16(6,0,true);
+  eocd.setUint16(8,entries.length,true); eocd.setUint16(10,entries.length,true);
+  eocd.setUint32(12,centralSize,true); eocd.setUint32(16,centralStart,true); eocd.setUint16(20,0,true);
+  const allParts = [...localParts, ...centralParts, new Uint8Array(eocd.buffer)];
+  let total=0; for (const p of allParts) total+=p.length;
+  const out = new Uint8Array(total);
+  let pos=0; for (const p of allParts){ out.set(p,pos); pos+=p.length; }
+  return out;
+}
+function downloadBlob(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href=url; a.download=filename; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+async function exportAllZip(){
+  const enc = new TextEncoder();
+  const entries = [];
+  for (let c=0;c<NUM_CLASSES;c++){
+    const items = await Store.listSamples(c);
+    for (const it of items) entries.push({ name:`motion/${CLASSES[c].folder}/${it.name}`, data: enc.encode(it.text) });
+  }
+  for (const fname of [ANN_WEIGHT_FILE, SNN_WEIGHT_FILE, CALIB_FILE]){
+    const buf = await Store.readWeightFile(fname);
+    if (buf) entries.push({ name:`header/${fname}`, data: new Uint8Array(buf) });
+  }
+  if (entries.length===0){ log('Nothing to export yet.'); return; }
+  downloadBlob(new Blob([makeZip(entries)], {type:'application/zip'}), 'imu-motion-data.zip');
+  log(`Exported ${entries.length} file(s) to imu-motion-data.zip.`);
+}
+async function importEntry(name, data){
+  if (!name || name.endsWith('/')) return;   // directory entries in the zip - nothing to import
+  if (name.startsWith('motion/') && name.endsWith('.csv')){
+    const rest = name.substring('motion/'.length);
+    const slash = rest.indexOf('/');
+    const folder = rest.substring(0,slash);
+    const classIdx = CLASSES.findIndex(c=>c.folder===folder);
+    if (classIdx<0) return;
+    await Store.captureSample(classIdx, new TextDecoder().decode(data));
+  } else if (name.startsWith('header/')){
+    const fname = name.substring('header/'.length);
+    await Store.writeWeightFile(fname, data.slice().buffer);
+    if (fname===ANN_WEIGHT_FILE) annDeserialize(data.slice().buffer);
+    if (fname===SNN_WEIGHT_FILE) snnDeserialize(data.slice().buffer);
+  }
+}
+async function importZipFile(file){
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  let eocdOffset = -1;
+  for (let i=buf.length-22; i>=0 && i>buf.length-22-65557; i--){
+    if (dv.getUint32(i,true)===0x06054b50){ eocdOffset=i; break; }
+  }
+  if (eocdOffset<0){ log('Not a valid zip file.'); return; }
+  const entryCount = dv.getUint16(eocdOffset+10,true);
+  let pos = dv.getUint32(eocdOffset+16,true);
+  let imported=0, skipped=0;
+  for (let e=0;e<entryCount;e++){
+    if (dv.getUint32(pos,true)!==0x02014b50) break;
+    const method = dv.getUint16(pos+10,true);
+    const compSize = dv.getUint32(pos+20,true);
+    const nameLen = dv.getUint16(pos+28,true);
+    const extraLen = dv.getUint16(pos+30,true);
+    const commentLen = dv.getUint16(pos+32,true);
+    const localOffset = dv.getUint32(pos+42,true);
+    const name = new TextDecoder().decode(buf.subarray(pos+46,pos+46+nameLen));
+    pos += 46+nameLen+extraLen+commentLen;
+    if (method!==0){ skipped++; continue; }
+    const lNameLen = dv.getUint16(localOffset+26,true);
+    const lExtraLen = dv.getUint16(localOffset+28,true);
+    const dataStart = localOffset+30+lNameLen+lExtraLen;
+    await importEntry(name, buf.subarray(dataStart, dataStart+compSize));
+    imported++;
+  }
+  log(`Import complete: ${imported} file(s) imported${skipped?', '+skipped+' skipped (compressed entries not supported - re-zip using this page\'s Export, or upload plain .csv/.bin files instead)':''}.`);
+  await refreshActiveClassMask();
+  buildClassGrid();
+}
+async function downloadWeightFile(name){
+  const buf = await Store.readWeightFile(name);
+  if (!buf){ log(`No ${name} saved yet.`); return; }
+  downloadBlob(new Blob([buf],{type:'application/octet-stream'}), name);
+}
+async function uploadWeightFile(name, file){
+  const buf = await file.arrayBuffer();
+  await Store.writeWeightFile(name, buf);
+  if (name===ANN_WEIGHT_FILE){ const ok=annDeserialize(buf); log(ok?'[ANN] Weights loaded from file.':'[ANN] File size does not match this architecture - not loaded.'); }
+  if (name===SNN_WEIGHT_FILE){ const ok=snnDeserialize(buf); log(ok?'[SNN] Weights loaded from file.':'[SNN] File size does not match this architecture - not loaded.'); }
+}
+async function importCsvFilesForClass(classIdx, fileList){
+  let n=0;
+  for (const f of fileList){ await Store.captureSample(classIdx, await f.text()); n++; }
+  log(`[Import] Added ${n} CSV file(s) to '${CLASSES[classIdx].label}'.`);
+  await refreshActiveClassMask();
+  buildClassGrid();
+  if (!document.getElementById('collectPanel').classList.contains('hidden')) openCollect(classIdx);
+}
+
+// ======================================================================
+// SENSOR LAYER - DeviceMotion, resampled to a fixed 25ms tick like the
+// device's IMU polling loop.
+// ======================================================================
+let latestAccel = { x:0, y:0, z:1 }; // in g
+let motionEnabled = false;
+
+function onDeviceMotion(e){
+  const a = e.accelerationIncludingGravity || e.acceleration;
+  if (!a || a.x===null || a.x===undefined) return;
+  latestAccel.x = a.x / G_MS2;
+  latestAccel.y = a.y / G_MS2;
+  latestAccel.z = a.z / G_MS2;
+}
+async function enableMotionSensors(){
+  if (!window.isSecureContext){
+    log('This page is not running in a secure context (https/localhost) - motion sensors will likely be blocked.');
+  }
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+    try {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res !== 'granted'){ log('Motion permission denied.'); return false; }
+    } catch(e){ log('Motion permission request failed: '+e.message); return false; }
+  }
+  window.addEventListener('devicemotion', onDeviceMotion);
+  motionEnabled = true;
+  document.getElementById('motionStatus').innerHTML = 'Motion sensors: <span class="ok">enabled</span>';
+  document.getElementById('btnCalibrate').disabled = false;
+  log('Motion sensors enabled.');
+  return true;
+}
+function readAccelG(){ return [latestAccel.x, latestAccel.y, latestAccel.z]; }
+
+// One "gesture" = 40 samples @ 25ms, same cadence as the device's capture loop.
+async function sampleGesture(consumeFn){
+  for (let t=0;t<IMU_TIMESTEPS;t++){
+    const tS = performance.now();
+    consumeFn(t, readAccelG());
+    const el = performance.now()-tS;
+    if (el < SAMPLE_INTERVAL_MS) await sleep(SAMPLE_INTERVAL_MS-el);
+  }
+}
+async function calibrate(){
+  log('Calibrating... keep the phone still.');
+  const CALIB_SAMPLES = 80;
+  const sum=[0,0,0], sum2=[0,0,0];
+  for (let i=0;i<CALIB_SAMPLES;i++){
+    const v = readAccelG();
+    for (let a=0;a<3;a++){ sum[a]+=v[a]; sum2[a]+=v[a]*v[a]; }
+    await sleep(SAMPLE_INTERVAL_MS);
+  }
+  for (let a=0;a<3;a++){
+    myAccelMean[a] = sum[a]/CALIB_SAMPLES;
+    const varr = sum2[a]/CALIB_SAMPLES - myAccelMean[a]*myAccelMean[a];
+    myAccelStd[a] = Math.max(Math.sqrt(Math.max(varr,0)), 0.01);
+  }
+  const buf = new ArrayBuffer(24);
+  const dv = new DataView(buf);
+  for (let a=0;a<3;a++) dv.setFloat32(a*4, myAccelMean[a], true);
+  for (let a=0;a<3;a++) dv.setFloat32(12+a*4, myAccelStd[a], true);
+  await Store.writeWeightFile(CALIB_FILE, buf);
+  log('Calibration done. mean='+myAccelMean.map(v=>v.toFixed(3)).join(',')+' std='+myAccelStd.map(v=>v.toFixed(3)).join(','));
+}
+
+// ======================================================================
+// SHARED MATH HELPERS
+// ======================================================================
+function leakyRelu(x){ return x>0?x:0.1*x; }
+function leakyReluDeriv(x){ return x>0?1:0.1; }
+function softmaxInPlace(arr){
+  let mx=arr[0]; for (let i=1;i<arr.length;i++) if (arr[i]>mx) mx=arr[i];
+  let sum=0; for (let i=0;i<arr.length;i++){ arr[i]=Math.exp(arr[i]-mx); sum+=arr[i]; }
+  for (let i=0;i<arr.length;i++) arr[i]/=sum;
+}
+function scaleArray(a,s){ for (let i=0;i<a.length;i++) a[i]*=s; }
+function shuffleArray(arr){ for (let i=arr.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; } }
+function adamUpdate(w,grad,m,v,lr,step){
+  const b1=0.9,b2=0.999,eps=1e-8;
+  const bc1=1-Math.pow(b1,step), bc2=1-Math.pow(b2,step);
+  for (let i=0;i<w.length;i++){
+    m[i]=b1*m[i]+(1-b1)*grad[i];
+    v[i]=b2*v[i]+(1-b2)*grad[i]*grad[i];
+    w[i]-=lr*(m[i]/bc1)/(Math.sqrt(v[i]/bc2)+eps);
+  }
+}
+function makeParamSet(fields){ const o={}; for (const [n,s] of fields) o[n]=new Float32Array(s); return o; }
+function argmaxActive(scores){
+  let best=-1;
+  for (let j=0;j<scores.length;j++){ if (!activeClassMask[j]) continue; if (best===-1 || scores[j]>scores[best]) best=j; }
+  return best===-1?0:best;
+}
+async function refreshActiveClassMask(){
+  let any=false;
+  for (let c=0;c<NUM_CLASSES;c++){
+    const n = await Store.countSamples(c);
+    activeClassMask[c] = (n>0) || classEverTrained[c];
+    if (activeClassMask[c]) any=true;
+  }
+  if (!any) activeClassMask.fill(true);
+}
+function normalizeInput(buf){
+  for (let t=0;t<IMU_TIMESTEPS;t++) for (let a=0;a<IMU_AXES;a++){
+    const idx = t*IMU_AXES+a;
+    let v = (buf[idx]-myAccelMean[a])/(myAccelStd[a]+1e-8);
+    if (!isFinite(v)) v=0;
+    buf[idx] = Math.max(-5, Math.min(5, v));
+  }
+}
+function parseCsv(text){
+  const buf = new Float32Array(IMU_TIMESTEPS*IMU_AXES);
+  const lines = text.trim().split('\n');
+  for (let t=0;t<IMU_TIMESTEPS && t<lines.length;t++){
+    const parts = lines[t].trim().split(',');
+    for (let a=0;a<IMU_AXES;a++) buf[t*IMU_AXES+a] = parseFloat(parts[a])||0;
+  }
+  return buf;
+}
+function toCsv(samples){ return samples.map(v=>v.map(x=>x.toFixed(5)).join(',')).join('\n')+'\n'; }
+
+// ======================================================================
+// ANN MODEL - windowed Conv1D -> Dense -> Dense -> Output, backprop+Adam
+// Ported line-for-line from myAnnForward/myAnnBackward in the firmware.
+// ======================================================================
+const ANN_FIELDS = [
+  ['conv1_w', CONV1_WEIGHTS_ANN], ['conv1_b', CONV1_FILTERS],
+  ['dense1_w', DENSE1_WEIGHTS_ANN], ['dense1_b', DENSE1_SIZE],
+  ['dense2_w', DENSE2_WEIGHTS], ['dense2_b', DENSE2_SIZE],
+  ['output_w', OUTPUT_WEIGHTS], ['output_b', NUM_CLASSES],
+];
+const Ann = makeParamSet(ANN_FIELDS);
+Ann.trained=false; Ann.adamStep=0;
+Ann.freezeConv1=Ann.freezeDense1=Ann.freezeDense2=Ann.freezeOutput=false;
+const AnnGrad = makeParamSet(ANN_FIELDS);
+const AnnM = makeParamSet(ANN_FIELDS);
+const AnnV = makeParamSet(ANN_FIELDS);
+
+const annConv1Out = new Float32Array(CONV1_OUT_STEPS*CONV1_FILTERS);
+const annPool1Out = new Float32Array(CONV1_FLAT);
+const annDense1Out = new Float32Array(DENSE1_SIZE);
+const annDense2Out = new Float32Array(DENSE2_SIZE);
+const annFinal = new Float32Array(NUM_CLASSES);
+const annOutDelta = new Float32Array(NUM_CLASSES);
+const annD2Delta = new Float32Array(DENSE2_SIZE);
+const annD1Delta = new Float32Array(DENSE1_SIZE);
+const annConv1Delta = new Float32Array(CONV1_OUT_STEPS*CONV1_FILTERS);
+
+function annInit(){
+  const c1=Math.sqrt(2/(CONV1_KERNEL*IMU_AXES));
+  for (let i=0;i<CONV1_WEIGHTS_ANN;i++) Ann.conv1_w[i]=(Math.random()-0.5)*2*c1;
+  const d1=Math.sqrt(2/CONV1_FLAT);
+  for (let i=0;i<DENSE1_WEIGHTS_ANN;i++) Ann.dense1_w[i]=(Math.random()-0.5)*2*d1;
+  const d2=Math.sqrt(2/DENSE1_SIZE);
+  for (let i=0;i<DENSE2_WEIGHTS;i++) Ann.dense2_w[i]=(Math.random()-0.5)*2*d2;
+  const od=Math.sqrt(2/DENSE2_SIZE);
+  for (let i=0;i<OUTPUT_WEIGHTS;i++) Ann.output_w[i]=(Math.random()-0.5)*2*od;
+}
+function annForward(input){
+  for (let s=0;s<CONV1_OUT_STEPS;s++) for (let f=0;f<CONV1_FILTERS;f++){
+    let sum=Ann.conv1_b[f];
+    for (let k=0;k<CONV1_KERNEL;k++) for (let a=0;a<IMU_AXES;a++)
+      sum += input[(s+k)*IMU_AXES+a]*Ann.conv1_w[(k*IMU_AXES+a)*CONV1_FILTERS+f];
+    annConv1Out[s*CONV1_FILTERS+f] = leakyRelu(sum);
+  }
+  for (let s=0;s<POOL1_STEPS;s++) for (let f=0;f<CONV1_FILTERS;f++){
+    const a=annConv1Out[(s*2)*CONV1_FILTERS+f], b=annConv1Out[(s*2+1)*CONV1_FILTERS+f];
+    annPool1Out[s*CONV1_FILTERS+f] = Math.max(a,b);
+  }
+  for (let j=0;j<DENSE1_SIZE;j++){ let sum=Ann.dense1_b[j]; for (let i=0;i<CONV1_FLAT;i++) sum+=annPool1Out[i]*Ann.dense1_w[i*DENSE1_SIZE+j]; annDense1Out[j]=leakyRelu(sum); }
+  for (let j=0;j<DENSE2_SIZE;j++){ let sum=Ann.dense2_b[j]; for (let i=0;i<DENSE1_SIZE;i++) sum+=annDense1Out[i]*Ann.dense2_w[i*DENSE2_SIZE+j]; annDense2Out[j]=leakyRelu(sum); }
+  for (let j=0;j<NUM_CLASSES;j++){ let sum=Ann.output_b[j]; for (let i=0;i<DENSE2_SIZE;i++) sum+=annDense2Out[i]*Ann.output_w[i*NUM_CLASSES+j]; annFinal[j]=sum; }
+  softmaxInPlace(annFinal);
+}
+function annZeroGrad(){ for (const k in AnnGrad) if (AnnGrad[k] instanceof Float32Array) AnnGrad[k].fill(0); }
+function annBackward(input,label){
+  for (let j=0;j<NUM_CLASSES;j++) annOutDelta[j]=annFinal[j]-(j===label?1:0);
+  for (let i=0;i<DENSE2_SIZE;i++) for (let j=0;j<NUM_CLASSES;j++) AnnGrad.output_w[i*NUM_CLASSES+j]+=annDense2Out[i]*annOutDelta[j];
+  for (let j=0;j<NUM_CLASSES;j++) AnnGrad.output_b[j]+=annOutDelta[j];
+  for (let i=0;i<DENSE2_SIZE;i++){ let s=0; for (let j=0;j<NUM_CLASSES;j++) s+=Ann.output_w[i*NUM_CLASSES+j]*annOutDelta[j]; annD2Delta[i]=s*leakyReluDeriv(annDense2Out[i]); }
+  for (let i=0;i<DENSE1_SIZE;i++) for (let j=0;j<DENSE2_SIZE;j++) AnnGrad.dense2_w[i*DENSE2_SIZE+j]+=annDense1Out[i]*annD2Delta[j];
+  for (let j=0;j<DENSE2_SIZE;j++) AnnGrad.dense2_b[j]+=annD2Delta[j];
+  for (let i=0;i<DENSE1_SIZE;i++){ let s=0; for (let j=0;j<DENSE2_SIZE;j++) s+=Ann.dense2_w[i*DENSE2_SIZE+j]*annD2Delta[j]; annD1Delta[i]=s*leakyReluDeriv(annDense1Out[i]); }
+  for (let i=0;i<CONV1_FLAT;i++) for (let j=0;j<DENSE1_SIZE;j++) AnnGrad.dense1_w[i*DENSE1_SIZE+j]+=annPool1Out[i]*annD1Delta[j];
+  for (let j=0;j<DENSE1_SIZE;j++) AnnGrad.dense1_b[j]+=annD1Delta[j];
+  const annPoolDelta = new Float32Array(CONV1_FLAT);
+  for (let s=0;s<POOL1_STEPS;s++) for (let f=0;f<CONV1_FILTERS;f++){
+    let g=0; for (let j=0;j<DENSE1_SIZE;j++) g+=Ann.dense1_w[(s*CONV1_FILTERS+f)*DENSE1_SIZE+j]*annD1Delta[j];
+    annPoolDelta[s*CONV1_FILTERS+f]=g;
+    const a=annConv1Out[(s*2)*CONV1_FILTERS+f], b=annConv1Out[(s*2+1)*CONV1_FILTERS+f];
+    annConv1Delta[(s*2)*CONV1_FILTERS+f] = (a>=b)?g:0;
+    annConv1Delta[(s*2+1)*CONV1_FILTERS+f] = (b>a)?g:0;
+  }
+  for (let s=0;s<CONV1_OUT_STEPS;s++) for (let f=0;f<CONV1_FILTERS;f++){
+    const d = annConv1Delta[s*CONV1_FILTERS+f]*leakyReluDeriv(annConv1Out[s*CONV1_FILTERS+f]);
+    AnnGrad.conv1_b[f]+=d;
+    for (let k=0;k<CONV1_KERNEL;k++) for (let a=0;a<IMU_AXES;a++)
+      AnnGrad.conv1_w[(k*IMU_AXES+a)*CONV1_FILTERS+f]+=input[(s+k)*IMU_AXES+a]*d;
+  }
+}
+function annApplyAdamBatch(){
+  Ann.adamStep++;
+  if (!Ann.freezeConv1){ adamUpdate(Ann.conv1_w,AnnGrad.conv1_w,AnnM.conv1_w,AnnV.conv1_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.conv1_b,AnnGrad.conv1_b,AnnM.conv1_b,AnnV.conv1_b,LEARNING_RATE,Ann.adamStep); }
+  if (!Ann.freezeDense1){ adamUpdate(Ann.dense1_w,AnnGrad.dense1_w,AnnM.dense1_w,AnnV.dense1_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.dense1_b,AnnGrad.dense1_b,AnnM.dense1_b,AnnV.dense1_b,LEARNING_RATE,Ann.adamStep); }
+  if (!Ann.freezeDense2){ adamUpdate(Ann.dense2_w,AnnGrad.dense2_w,AnnM.dense2_w,AnnV.dense2_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.dense2_b,AnnGrad.dense2_b,AnnM.dense2_b,AnnV.dense2_b,LEARNING_RATE,Ann.adamStep); }
+  if (!Ann.freezeOutput){ adamUpdate(Ann.output_w,AnnGrad.output_w,AnnM.output_w,AnnV.output_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.output_b,AnnGrad.output_b,AnnM.output_b,AnnV.output_b,LEARNING_RATE,Ann.adamStep); }
+}
+function annSerialize(){
+  const totalFloats = CONV1_WEIGHTS_ANN+CONV1_FILTERS+DENSE1_WEIGHTS_ANN+DENSE1_SIZE+DENSE2_WEIGHTS+DENSE2_SIZE+OUTPUT_WEIGHTS+NUM_CLASSES;
+  const buf = new ArrayBuffer(totalFloats*4);
+  const dv = new DataView(buf);
+  let o=0;
+  const w = (a)=>{ for (let i=0;i<a.length;i++){ dv.setFloat32(o,a[i],true); o+=4; } };
+  w(Ann.conv1_w); w(Ann.conv1_b); w(Ann.dense1_w); w(Ann.dense1_b);
+  w(Ann.dense2_w); w(Ann.dense2_b); w(Ann.output_w); w(Ann.output_b);
+  return buf;
+}
+function annDeserialize(buf){
+  const totalFloats = CONV1_WEIGHTS_ANN+CONV1_FILTERS+DENSE1_WEIGHTS_ANN+DENSE1_SIZE+DENSE2_WEIGHTS+DENSE2_SIZE+OUTPUT_WEIGHTS+NUM_CLASSES;
+  if (buf.byteLength !== totalFloats*4) return false;
+  const dv = new DataView(buf);
+  let o=0;
+  const r = (a)=>{ for (let i=0;i<a.length;i++){ a[i]=dv.getFloat32(o,true); o+=4; } };
+  r(Ann.conv1_w); r(Ann.conv1_b); r(Ann.dense1_w); r(Ann.dense1_b);
+  r(Ann.dense2_w); r(Ann.dense2_b); r(Ann.output_w); r(Ann.output_b);
+  Ann.trained = true;
+  return true;
+}
+async function annSaveWeights(){ await Store.writeWeightFile(ANN_WEIGHT_FILE, annSerialize()); }
+async function annLoadWeights(){ const buf = await Store.readWeightFile(ANN_WEIGHT_FILE); return buf ? annDeserialize(buf) : false; }
+
+// ======================================================================
+// SNN MODEL - streaming, causal, surrogate-gradient BPTT
+// Ported line-for-line from mySnnTick/mySnnBackwardBPTT in the firmware.
+// ======================================================================
+const SNN_FIELDS = [
+  ['conv1_w', CONV1_WEIGHTS_SNN], ['conv1_b', CONV1_FILTERS],
+  ['dense1_w', DENSE1_WEIGHTS_SNN], ['dense1_b', DENSE1_SIZE],
+  ['dense2_w', DENSE2_WEIGHTS], ['dense2_b', DENSE2_SIZE],
+  ['output_w', OUTPUT_WEIGHTS], ['output_b', NUM_CLASSES],
+];
+const Snn = makeParamSet(SNN_FIELDS);
+Snn.trained=false; Snn.adamStep=0;
+Snn.freezeConv1=Snn.freezeDense1=Snn.freezeDense2=Snn.freezeOutput=false;
+const SnnGrad = makeParamSet(SNN_FIELDS);
+const SnnM = makeParamSet(SNN_FIELDS);
+const SnnV = makeParamSet(SNN_FIELDS);
+
+function snnInit(){
+  const c1=Math.sqrt(2/(CONV1_KERNEL*SNN_CHANNELS));
+  for (let i=0;i<CONV1_WEIGHTS_SNN;i++) Snn.conv1_w[i]=(Math.random()-0.5)*2*c1;
+  const d1=Math.sqrt(2/CONV1_FILTERS);
+  for (let i=0;i<DENSE1_WEIGHTS_SNN;i++) Snn.dense1_w[i]=(Math.random()-0.5)*2*d1;
+  const d2=Math.sqrt(2/DENSE1_SIZE);
+  for (let i=0;i<DENSE2_WEIGHTS;i++) Snn.dense2_w[i]=(Math.random()-0.5)*2*d2;
+  const od=Math.sqrt(2/DENSE2_SIZE);
+  for (let i=0;i<OUTPUT_WEIGHTS;i++) Snn.output_w[i]=(Math.random()-0.5)*2*od;
+}
+function makeSpikeEncoder(){
+  return {
+    ref:[0,0,0], primed:false,
+    reset(){ this.primed=false; },
+    step(g,out){
+      if (!this.primed){ this.ref=[g[0],g[1],g[2]]; this.primed=true; }
+      let any=false;
+      for (let a=0;a<3;a++){
+        const d=g[a]-this.ref[a];
+        const on=d>SPIKE_DELTA_G, off=d<-SPIKE_DELTA_G;
+        out[a*2]=on?1:0; out[a*2+1]=off?1:0;
+        if (on||off){ this.ref[a]=g[a]; any=true; }
+      }
+      out[SNN_IDLE_CH]=any?0:1;
+    }
+  };
+}
+function surrogateDeriv(memPre){ const d=1+SURROGATE_K*Math.abs(memPre-LIF_THRESHOLD); return 1/(d*d); }
+
+let streamRing, streamRingFill=0, streamTickParity=0;
+const streamConv1MemPost = new Float32Array(CONV1_FILTERS);
+const streamPooledHeld = new Float32Array(CONV1_FILTERS);
+const streamDense1MemPost = new Float32Array(DENSE1_SIZE);
+const streamDense2MemPost = new Float32Array(DENSE2_SIZE);
+const streamTrace = new Float32Array(NUM_CLASSES);
+let convSpikePrevTick = new Uint8Array(CONV1_FILTERS);
+let streamConv1Spikes=0, streamDense1Spikes=0, streamDense2Spikes=0, streamTicks=0;
+
+function snnResetDynamics(){
+  streamRing = Array.from({length:CONV1_KERNEL},()=>new Float32Array(SNN_CHANNELS));
+  streamRingFill=0; streamTickParity=0;
+  streamConv1MemPost.fill(0); streamPooledHeld.fill(0);
+  streamDense1MemPost.fill(0); streamDense2MemPost.fill(0); streamTrace.fill(0);
+}
+function snnResetStreamState(){ snnResetDynamics(); streamConv1Spikes=streamDense1Spikes=streamDense2Spikes=streamTicks=0; }
+snnResetDynamics();
+
+let rConv1MemPre, rConv1Spike, rPooled, rDense1MemPre, rDense1Spike, rDense2MemPre, rDense2Spike, rTrace;
+let snnSpikeInput;
+function allocRecording(){
+  rConv1MemPre=new Float32Array(IMU_TIMESTEPS*CONV1_FILTERS);
+  rConv1Spike=new Uint8Array(IMU_TIMESTEPS*CONV1_FILTERS);
+  rPooled=new Float32Array(IMU_TIMESTEPS*CONV1_FILTERS);
+  rDense1MemPre=new Float32Array(IMU_TIMESTEPS*DENSE1_SIZE);
+  rDense1Spike=new Uint8Array(IMU_TIMESTEPS*DENSE1_SIZE);
+  rDense2MemPre=new Float32Array(IMU_TIMESTEPS*DENSE2_SIZE);
+  rDense2Spike=new Uint8Array(IMU_TIMESTEPS*DENSE2_SIZE);
+  rTrace=new Float32Array(IMU_TIMESTEPS*NUM_CLASSES);
+  snnSpikeInput=new Float32Array(IMU_TIMESTEPS*SNN_CHANNELS);
+}
+
+function snnTick(spikeSample, record, tIdx){
+  for (let k=0;k<CONV1_KERNEL-1;k++) streamRing[k].set(streamRing[k+1]);
+  streamRing[CONV1_KERNEL-1].set(spikeSample);
+  if (streamRingFill<CONV1_KERNEL) streamRingFill++;
+  streamTicks++;
+
+  const curConvSpike = new Uint8Array(CONV1_FILTERS);
+  const missing = CONV1_KERNEL - streamRingFill;
+  for (let f=0;f<CONV1_FILTERS;f++){
+    let current = Snn.conv1_b[f];
+    for (let k=missing;k<CONV1_KERNEL;k++)
+      for (let a=0;a<SNN_CHANNELS;a++)
+        current += streamRing[k][a]*Snn.conv1_w[(k*SNN_CHANNELS+a)*CONV1_FILTERS+f];
+    const memPre = streamConv1MemPost[f]*LIF_LEAK + current;
+    const spike = memPre>=LIF_THRESHOLD?1:0;
+    if (record){ rConv1MemPre[tIdx*CONV1_FILTERS+f]=memPre; rConv1Spike[tIdx*CONV1_FILTERS+f]=spike; }
+    if (spike) streamConv1Spikes++;
+    streamConv1MemPost[f] = memPre - (spike?LIF_THRESHOLD:0);
+    curConvSpike[f]=spike;
+  }
+  if (streamTickParity===0){
+    convSpikePrevTick.set(curConvSpike);
+  } else {
+    for (let f=0;f<CONV1_FILTERS;f++) streamPooledHeld[f] = (convSpikePrevTick[f]|curConvSpike[f]) ? 1:0;
+  }
+  streamTickParity = 1-streamTickParity;
+  if (record) for (let f=0;f<CONV1_FILTERS;f++) rPooled[tIdx*CONV1_FILTERS+f]=streamPooledHeld[f];
+
+  const d1spike = new Uint8Array(DENSE1_SIZE);
+  for (let j=0;j<DENSE1_SIZE;j++){
+    let current = Snn.dense1_b[j];
+    for (let i=0;i<CONV1_FILTERS;i++) current += streamPooledHeld[i]*Snn.dense1_w[i*DENSE1_SIZE+j];
+    const memPre = streamDense1MemPost[j]*LIF_LEAK+current;
+    const spike = memPre>=LIF_THRESHOLD?1:0;
+    if (record){ rDense1MemPre[tIdx*DENSE1_SIZE+j]=memPre; rDense1Spike[tIdx*DENSE1_SIZE+j]=spike; }
+    if (spike) streamDense1Spikes++;
+    streamDense1MemPost[j]=memPre-(spike?LIF_THRESHOLD:0);
+    d1spike[j]=spike;
+  }
+  const d2spike = new Uint8Array(DENSE2_SIZE);
+  for (let j=0;j<DENSE2_SIZE;j++){
+    let current = Snn.dense2_b[j];
+    for (let i=0;i<DENSE1_SIZE;i++) current += d1spike[i]*Snn.dense2_w[i*DENSE2_SIZE+j];
+    const memPre = streamDense2MemPost[j]*LIF_LEAK+current;
+    const spike = memPre>=LIF_THRESHOLD?1:0;
+    if (record){ rDense2MemPre[tIdx*DENSE2_SIZE+j]=memPre; rDense2Spike[tIdx*DENSE2_SIZE+j]=spike; }
+    if (spike) streamDense2Spikes++;
+    streamDense2MemPost[j]=memPre-(spike?LIF_THRESHOLD:0);
+    d2spike[j]=spike;
+  }
+  for (let c=0;c<NUM_CLASSES;c++){
+    let current = Snn.output_b[c];
+    for (let i=0;i<DENSE2_SIZE;i++) current += d2spike[i]*Snn.output_w[i*NUM_CLASSES+c];
+    streamTrace[c] = streamTrace[c]*SNN_TRACE_LEAK+current;
+    if (record) rTrace[tIdx*NUM_CLASSES+c]=streamTrace[c];
+  }
+  return argmaxActive(streamTrace);
+}
+
+function snnZeroGrad(){ for (const k in SnnGrad) if (SnnGrad[k] instanceof Float32Array) SnnGrad[k].fill(0); }
+function snnScaleGrad(s){ for (const k in SnnGrad) if (SnnGrad[k] instanceof Float32Array) scaleArray(SnnGrad[k], s); }
+
+function snnBackwardBPTT(label){
+  const dTrace = new Float32Array(NUM_CLASSES);
+  const lossW = 1/(IMU_TIMESTEPS-TRAIN_LOSS_FROM_TICK);
+  let lossTotal = 0;
+  let dDense2MemPost = new Float32Array(DENSE2_SIZE);
+  let dDense1MemPost = new Float32Array(DENSE1_SIZE);
+  let dConv1MemPost = new Float32Array(CONV1_FILTERS);
+  const dPooledAccum = Array.from({length:IMU_TIMESTEPS},()=>new Float32Array(CONV1_FILTERS));
+  const p = new Float32Array(NUM_CLASSES);
+
+  for (let t=IMU_TIMESTEPS-1; t>=0; t--){
+    if (t>=TRAIN_LOSS_FROM_TICK){
+      for (let c=0;c<NUM_CLASSES;c++) p[c]=rTrace[t*NUM_CLASSES+c];
+      softmaxInPlace(p);
+      lossTotal += -Math.log(Math.max(p[label],1e-7))*lossW;
+      for (let c=0;c<NUM_CLASSES;c++) dTrace[c] += (p[c]-(c===label?1:0))*lossW;
+    }
+    const dOutCurrent = new Float32Array(NUM_CLASSES);
+    for (let c=0;c<NUM_CLASSES;c++) dOutCurrent[c]=dTrace[c];
+    for (let c=0;c<NUM_CLASSES;c++) dTrace[c]*=SNN_TRACE_LEAK;
+
+    const d2off = t*DENSE2_SIZE;
+    const dDense2Spike = new Float32Array(DENSE2_SIZE);
+    for (let c=0;c<NUM_CLASSES;c++){
+      if (!Snn.freezeOutput){
+        SnnGrad.output_b[c]+=dOutCurrent[c];
+        for (let i=0;i<DENSE2_SIZE;i++) SnnGrad.output_w[i*NUM_CLASSES+c]+=rDense2Spike[d2off+i]*dOutCurrent[c];
+      }
+      for (let i=0;i<DENSE2_SIZE;i++) dDense2Spike[i]+=Snn.output_w[i*NUM_CLASSES+c]*dOutCurrent[c];
+    }
+    const dDense2MemPre = new Float32Array(DENSE2_SIZE);
+    for (let j=0;j<DENSE2_SIZE;j++){
+      const sg = surrogateDeriv(rDense2MemPre[t*DENSE2_SIZE+j]);
+      dDense2MemPre[j] = dDense2Spike[j]*sg + dDense2MemPost[j];
+    }
+    const d1off = t*DENSE1_SIZE;
+    const dDense1Spike = new Float32Array(DENSE1_SIZE);
+    for (let j=0;j<DENSE2_SIZE;j++){
+      if (!Snn.freezeDense2){
+        SnnGrad.dense2_b[j]+=dDense2MemPre[j];
+        for (let i=0;i<DENSE1_SIZE;i++) SnnGrad.dense2_w[i*DENSE2_SIZE+j]+=rDense1Spike[d1off+i]*dDense2MemPre[j];
+      }
+      for (let i=0;i<DENSE1_SIZE;i++) dDense1Spike[i]+=Snn.dense2_w[i*DENSE2_SIZE+j]*dDense2MemPre[j];
+      dDense2MemPost[j] = dDense2MemPre[j]*LIF_LEAK;
+    }
+    const dDense1MemPre = new Float32Array(DENSE1_SIZE);
+    for (let j=0;j<DENSE1_SIZE;j++){
+      const sg = surrogateDeriv(rDense1MemPre[t*DENSE1_SIZE+j]);
+      dDense1MemPre[j] = dDense1Spike[j]*sg + dDense1MemPost[j];
+    }
+    for (let j=0;j<DENSE1_SIZE;j++){
+      if (!Snn.freezeDense1){
+        SnnGrad.dense1_b[j]+=dDense1MemPre[j];
+        for (let i=0;i<CONV1_FILTERS;i++) SnnGrad.dense1_w[i*DENSE1_SIZE+j]+=rPooled[t*CONV1_FILTERS+i]*dDense1MemPre[j];
+      }
+      for (let i=0;i<CONV1_FILTERS;i++) dPooledAccum[t][i]+=Snn.dense1_w[i*DENSE1_SIZE+j]*dDense1MemPre[j];
+      dDense1MemPost[j]=dDense1MemPre[j]*LIF_LEAK;
+    }
+  }
+
+  const dConvSpikeFromPool = Array.from({length:IMU_TIMESTEPS},()=>new Float32Array(CONV1_FILTERS));
+  for (let t=1;t<IMU_TIMESTEPS;t++){
+    const pairStart = 2*Math.floor((t-1)/2);
+    for (let f=0;f<CONV1_FILTERS;f++){
+      dConvSpikeFromPool[pairStart][f] += dPooledAccum[t][f];
+      dConvSpikeFromPool[pairStart+1][f] += dPooledAccum[t][f];
+    }
+  }
+  for (let t=IMU_TIMESTEPS-1;t>=0;t--){
+    const dConv1MemPre = new Float32Array(CONV1_FILTERS);
+    for (let f=0;f<CONV1_FILTERS;f++){
+      const sg = surrogateDeriv(rConv1MemPre[t*CONV1_FILTERS+f]);
+      dConv1MemPre[f] = dConvSpikeFromPool[t][f]*sg + dConv1MemPost[f];
+    }
+    if (!Snn.freezeConv1){
+      for (let f=0;f<CONV1_FILTERS;f++){
+        SnnGrad.conv1_b[f]+=dConv1MemPre[f];
+        for (let k=0;k<CONV1_KERNEL;k++){
+          const srcT = t-(CONV1_KERNEL-1)+k;
+          if (srcT<0) continue;
+          for (let a=0;a<SNN_CHANNELS;a++)
+            SnnGrad.conv1_w[(k*SNN_CHANNELS+a)*CONV1_FILTERS+f]+=snnSpikeInput[srcT*SNN_CHANNELS+a]*dConv1MemPre[f];
+        }
+      }
+    }
+    for (let f=0;f<CONV1_FILTERS;f++) dConv1MemPost[f]=dConv1MemPre[f]*LIF_LEAK;
+  }
+  return lossTotal;
+}
+function snnApplyAdam(){
+  Snn.adamStep++;
+  if (!Snn.freezeConv1){ adamUpdate(Snn.conv1_w,SnnGrad.conv1_w,SnnM.conv1_w,SnnV.conv1_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.conv1_b,SnnGrad.conv1_b,SnnM.conv1_b,SnnV.conv1_b,LEARNING_RATE,Snn.adamStep); }
+  if (!Snn.freezeDense1){ adamUpdate(Snn.dense1_w,SnnGrad.dense1_w,SnnM.dense1_w,SnnV.dense1_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.dense1_b,SnnGrad.dense1_b,SnnM.dense1_b,SnnV.dense1_b,LEARNING_RATE,Snn.adamStep); }
+  if (!Snn.freezeDense2){ adamUpdate(Snn.dense2_w,SnnGrad.dense2_w,SnnM.dense2_w,SnnV.dense2_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.dense2_b,SnnGrad.dense2_b,SnnM.dense2_b,SnnV.dense2_b,LEARNING_RATE,Snn.adamStep); }
+  if (!Snn.freezeOutput){ adamUpdate(Snn.output_w,SnnGrad.output_w,SnnM.output_w,SnnV.output_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.output_b,SnnGrad.output_b,SnnM.output_b,SnnV.output_b,LEARNING_RATE,Snn.adamStep); }
+}
+function snnSerialize(){
+  const totalFloats = CONV1_WEIGHTS_SNN+CONV1_FILTERS+DENSE1_WEIGHTS_SNN+DENSE1_SIZE+DENSE2_WEIGHTS+DENSE2_SIZE+OUTPUT_WEIGHTS+NUM_CLASSES;
+  const buf = new ArrayBuffer(totalFloats*4);
+  const dv = new DataView(buf);
+  let o=0;
+  const w=(a)=>{ for (let i=0;i<a.length;i++){ dv.setFloat32(o,a[i],true); o+=4; } };
+  w(Snn.conv1_w); w(Snn.conv1_b); w(Snn.dense1_w); w(Snn.dense1_b);
+  w(Snn.dense2_w); w(Snn.dense2_b); w(Snn.output_w); w(Snn.output_b);
+  return buf;
+}
+function snnDeserialize(buf){
+  const totalFloats = CONV1_WEIGHTS_SNN+CONV1_FILTERS+DENSE1_WEIGHTS_SNN+DENSE1_SIZE+DENSE2_WEIGHTS+DENSE2_SIZE+OUTPUT_WEIGHTS+NUM_CLASSES;
+  if (buf.byteLength !== totalFloats*4) return false;
+  const dv = new DataView(buf);
+  let o=0;
+  const r=(a)=>{ for (let i=0;i<a.length;i++){ a[i]=dv.getFloat32(o,true); o+=4; } };
+  r(Snn.conv1_w); r(Snn.conv1_b); r(Snn.dense1_w); r(Snn.dense1_b);
+  r(Snn.dense2_w); r(Snn.dense2_b); r(Snn.output_w); r(Snn.output_b);
+  Snn.trained = true;
+  return true;
+}
+async function snnSaveWeights(){ await Store.writeWeightFile(SNN_WEIGHT_FILE, snnSerialize()); }
+async function snnLoadWeights(){ const buf = await Store.readWeightFile(SNN_WEIGHT_FILE); return buf ? snnDeserialize(buf) : false; }
+
+function augmentRep(buf){
+  const tmp = new Float32Array(IMU_TIMESTEPS*IMU_AXES);
+  const avg=[0,0,0];
+  const shift = Math.floor(Math.random()*(2*AUG_MAX_SHIFT+1))-AUG_MAX_SHIFT;
+  const gain = 1 + (Math.floor(Math.random()*201)-100)/100*AUG_GAIN_RANGE;
+  for (let t=0;t<IMU_TIMESTEPS;t++) for (let a=0;a<IMU_AXES;a++) avg[a]+=buf[t*IMU_AXES+a]/IMU_TIMESTEPS;
+  for (let t=0;t<IMU_TIMESTEPS;t++){
+    const src = Math.min(IMU_TIMESTEPS-1, Math.max(0, t+shift));
+    for (let a=0;a<IMU_AXES;a++) tmp[t*IMU_AXES+a] = avg[a] + (buf[src*IMU_AXES+a]-avg[a])*gain;
+  }
+  buf.set(tmp);
+}
+function snnEncodeFromRaw(rawBuf, augment){
+  if (augment) augmentRep(rawBuf);
+  const enc = makeSpikeEncoder();
+  const tmp = new Float32Array(SNN_CHANNELS);
+  for (let t=0;t<IMU_TIMESTEPS;t++){
+    enc.step([rawBuf[t*IMU_AXES], rawBuf[t*IMU_AXES+1], rawBuf[t*IMU_AXES+2]], tmp);
+    snnSpikeInput.set(tmp, t*SNN_CHANNELS);
+  }
+}
+
+// ======================================================================
+// OUTPUT ENGINE - Still/Delete/letter commit logic, identical to the
+// device's myCommitClass / myUpdateOutputStringSnn / myUpdateOutputStringAnn
+// ======================================================================
+let outputString = '';
+let lastCommittedClass = -1, lastCommitMs = 0;
+function classText(idx){ return CLASSES[idx].label; }
+function onOutputChanged(){ document.getElementById('transcript').value = outputString; }
+
+function commitClass(classIdx, mayRepeat){
+  const text = classText(classIdx);
+  const isDelete = text==='Delete', isStill = text==='Still';
+  if (classIdx===lastCommittedClass){
+    const deleteAgain = isDelete && (performance.now()-lastCommitMs >= DELETE_REPEAT_MS);
+    const letterAgain = !isDelete && !isStill && mayRepeat;
+    if (!deleteAgain && !letterAgain) return;
+  }
+  lastCommittedClass = classIdx;
+  lastCommitMs = performance.now();
+  if (text==='Still'){
+    if (outputString.length>0 && outputString[outputString.length-1]!==' '){ outputString+=' '; onOutputChanged(); }
+  } else if (isDelete){
+    if (outputString.length>0){ outputString = outputString.slice(0,-1); onOutputChanged(); }
+  } else {
+    outputString += text; onOutputChanged();
+  }
+  snnResetDynamics();
+}
+
+// ---- SNN gesture segmentation (mirrors myGestureTick/myClassifyGesture) ----
+// Motion is read straight from the spike encoder's own idle channel: a tick
+// is "moving" whenever any axis spiked (the idle channel did NOT fire).
+let gestureState = 'IDLE';   // 'IDLE' | 'ACTIVE' | 'ENDING' | 'COOLDOWN'
+let gestureTicks = 0, onsetMoveStreak = 0, stillStreak = 0, idleStillStreak = 0, settleTicksLeft = 0;
+let gestureProbSum = new Float32Array(NUM_CLASSES);
+let gestureEvidenceTicks = 0;
+let finalRing, finalRingPos = 0, finalRingFill = 0;
+let liveBestClass = 0, liveBestProb = 0;
+
+function resetGestureEvidence(){
+  gestureProbSum.fill(0);
+  gestureEvidenceTicks = 0;
+  finalRing = Array.from({length:FINAL_PORTION_TICKS},()=>new Float32Array(NUM_CLASSES));
+  finalRingPos = 0; finalRingFill = 0;
+}
+function resetGestureState(){
+  gestureState = 'IDLE';
+  gestureTicks=0; onsetMoveStreak=0; stillStreak=0; idleStillStreak=0; settleTicksLeft=0;
+  resetGestureEvidence();
+  liveBestClass=0; liveBestProb=0;
+}
+resetGestureEvidence();
+
+// Turns the live trace into a probability distribution, masking out any
+// class with no training data yet.
+function snnMaskedProbs(){
+  const p = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++) p[c] = activeClassMask[c] ? streamTrace[c] : -1e30;
+  softmaxInPlace(p);
+  return p;
+}
+function gestureAccumulate(p){
+  for (let c=0;c<NUM_CLASSES;c++) gestureProbSum[c]+=p[c];
+  gestureEvidenceTicks++;
+  finalRing[finalRingPos].set(p);
+  finalRingPos=(finalRingPos+1)%FINAL_PORTION_TICKS;
+  if (finalRingFill<FINAL_PORTION_TICKS) finalRingFill++;
+}
+// The ONE decision for a completed gesture - blends the whole-gesture average
+// with the average over just the final portion. "Still" is excluded here; it
+// has no motion to segment, so it can only come from the idle-stillness timeout.
+function classifyGesture(){
+  const n = Math.max(gestureEvidenceTicks,1);
+  const avgP = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++) avgP[c]=gestureProbSum[c]/n;
+  const fn = Math.max(finalRingFill,1);
+  const finalP = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++){ let s=0; for (let r=0;r<finalRingFill;r++) s+=finalRing[r][c]; finalP[c]=s/fn; }
+  const blended = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++) blended[c] = (1-GESTURE_FINAL_WEIGHT)*avgP[c] + GESTURE_FINAL_WEIGHT*finalP[c];
+
+  let best=-1, second=-1;
+  for (let c=0;c<NUM_CLASSES;c++){
+    if (!activeClassMask[c] || c===STILL_CLASS_IDX) continue;
+    if (best===-1 || blended[c]>blended[best]){ second=best; best=c; }
+    else if (second===-1 || blended[c]>blended[second]) second=c;
+  }
+  const margin = (best>=0 && second>=0) ? blended[best]-blended[second] : (best>=0 ? blended[best] : 0);
+
+  if (verboseInfer){
+    let line = '[FINAL] ';
+    for (let c=0;c<NUM_CLASSES;c++) if (activeClassMask[c] && c!==STILL_CLASS_IDX) line += `${CLASSES[c].label}=${blended[c].toFixed(2)} `;
+    log(line + `margin=${margin.toFixed(2)}`);
+  }
+
+  const longEnough = gestureTicks >= MIN_GESTURE_TICKS;
+  const confident = best>=0 && blended[best]>=GESTURE_COMMIT_MIN_PROB && margin>=GESTURE_COMMIT_MARGIN;
+  if (best>=0 && longEnough && confident){
+    if (verboseInfer) log(`[COMMIT] ${CLASSES[best].label}`);
+    commitClass(best, true);   // internally resets the SNN dynamics
+  } else {
+    if (verboseInfer) log(`[COMMIT] none (${!longEnough ? 'gesture too short' : 'not confident enough'})`);
+    snnResetDynamics();
+  }
+}
+// Call once per tick with this tick's raw spike sample and a tick counter
+// (used only for the [GESTURE] START log line).
+function gestureTick(spikeTick, currentTick){
+  const moving = spikeTick[SNN_IDLE_CH] < 0.5;
+
+  if (gestureState==='COOLDOWN'){
+    if (--settleTicksLeft <= 0) gestureState = 'IDLE';
+    return;
+  }
+
+  if (gestureState==='IDLE'){
+    if (moving){ onsetMoveStreak++; idleStillStreak=0; } else { onsetMoveStreak=0; idleStillStreak++; }
+    if (onsetMoveStreak >= GESTURE_ONSET_TICKS){
+      gestureState = 'ACTIVE';
+      gestureTicks = onsetMoveStreak;   // the onset ticks already counted as part of the gesture
+      stillStreak = 0;
+      resetGestureEvidence();
+      if (verboseInfer) log(`[GESTURE] START tick=${currentTick}`);
+    } else if (STILL_CLASS_IDX>=0 && idleStillStreak >= STILL_HOLD_TICKS){
+      // Sustained stillness with nothing else going on = a space. Safe to
+      // call every tick past the threshold: commitClass() no-ops if "Still"
+      // is already the last thing that was typed.
+      commitClass(STILL_CLASS_IDX, true);
+    }
+    return;
+  }
+
+  // ACTIVE or ENDING
+  gestureTicks++;
+  const p = snnMaskedProbs();
+  gestureAccumulate(p);
+  liveBestClass = argmaxActive(p);
+  liveBestProb = p[liveBestClass];
+
+  if (moving){ stillStreak=0; gestureState='ACTIVE'; } else { stillStreak++; gestureState='ENDING'; }
+
+  if (verboseInfer && gestureTicks%4===0){
+    log(`[GESTURE] ACTIVE tick=${gestureTicks} best=${CLASSES[liveBestClass].label} p=${liveBestProb.toFixed(2)}`);
+  }
+
+  const endedByStillness = stillStreak >= GESTURE_END_STILL_TICKS;
+  const endedByMaxLength = gestureTicks >= MAX_GESTURE_TICKS;
+  if (endedByStillness || endedByMaxLength){
+    if (verboseInfer) log(`[GESTURE] END duration=${gestureTicks} stillTicks=${stillStreak}${endedByMaxLength?' (max length reached)':''}`);
+    classifyGesture();
+    gestureState = 'COOLDOWN';
+    settleTicksLeft = RESET_SETTLE_TICKS;
+    onsetMoveStreak = 0;
+  }
+}
+
+let annPendingClass=-1, annPendingWindows=0;
+function resetOutputDebounceAnn(){ annPendingClass=-1; annPendingWindows=0; }
+function updateOutputStringAnn(pred, prob){
+  if (prob < ANN_COMMIT_MIN_PROB){ annPendingClass=-1; annPendingWindows=0; return; }
+  if (pred===annPendingClass) annPendingWindows++; else { annPendingClass=pred; annPendingWindows=1; }
+  if (annPendingWindows < ANN_CONFIRM_WINDOWS) return;
+  commitClass(pred, true);
+  annPendingWindows = 0;
+}
+
+// ======================================================================
+// ACTIONS: DATA COLLECTION
+// ======================================================================
+let collectClassIdx = 0;
+function openCollect(classIdx){
+  collectClassIdx = classIdx;
+  document.getElementById('collectPanel').classList.remove('hidden');
+  refreshCollectCount();
+}
+async function refreshCollectCount(){
+  const n = await Store.countSamples(collectClassIdx);
+  document.getElementById('collectTitle').textContent = `Collect: ${CLASSES[collectClassIdx].label}`;
+  document.getElementById('collectCount').textContent = `${n} sample(s) saved so far.`;
+}
+// Whole-page color cue so it's obvious, without watching the console, exactly
+// when to get ready and when to move: amber = get ready, green = recording now,
+// back to normal the instant this rep's capture window ends.
+function setCollectIndicator(state /* 'ready' | 'recording' | null */){
+  document.body.classList.toggle('collect-ready', state==='ready');
+  document.body.classList.toggle('collect-recording', state==='recording');
+}
+async function captureOneSample(classIdx){
+  log('[Collect] Recording in 1s...');
+  setCollectIndicator('ready');
+  await sleep(1000);
+  setCollectIndicator('recording');
+  const samples = [];
+  await sampleGesture((t,v)=>{ samples[t]=v; });
+  setCollectIndicator(null);
+  const name = await Store.captureSample(classIdx, toCsv(samples));
+  const n = await Store.countSamples(classIdx);
+  log(`[Collect] Saved ${name} for '${CLASSES[classIdx].label}' (total ${n}).`);
+  await refreshCollectCount();
+  buildClassGrid();
+}
+async function autoCollect(classIdx, count){
+  stopRequested = false;
+  for (let i=0;i<count;i++){
+    if (stopRequested){ log(`[Collect] Auto-collect stopped early after ${i}/${count}.`); return; }
+    log(`[Collect] Auto ${i+1}/${count}`);
+    await captureOneSample(classIdx);
+  }
+  log(`[Collect] Auto-collect complete: ${count} new samples.`);
+}
+
+// ======================================================================
+// ACTIONS: TRAINING DATA SET
+// ======================================================================
+async function buildTrainingList(){
+  const trainingData = [];
+  const counts = new Array(NUM_CLASSES).fill(0);
+  for (let c=0;c<NUM_CLASSES;c++){
+    const items = await Store.listSamples(c);
+    counts[c] = items.length;
+    for (const it of items) trainingData.push({ buf: parseCsv(it.text), label: c });
+  }
+  return { trainingData, counts };
+}
+function splitValidation(trainingData){
+  shuffleArray(trainingData);
+  const held = new Array(NUM_CLASSES).fill(0);
+  const valData=[], trainOnly=[];
+  if (VALIDATION_SAMPLES>0){
+    for (const it of trainingData){
+      if (held[it.label]<VALIDATION_SAMPLES){ valData.push(it); held[it.label]++; }
+      else trainOnly.push(it);
+    }
+    return { valData, trainData: trainOnly };
+  }
+  return { valData: [], trainData: trainingData };
+}
+
+// ======================================================================
+// ACTIONS: ANN TRAIN
+// ======================================================================
+async function trainAnnOnce(trainData, valData, tag){
+  const nTrain = Math.max(trainData.length,1);
+  let bestAcc=-1, bestEpoch=-1;
+  for (let epoch=0; epoch<TARGET_EPOCHS; epoch++){
+    if (stopRequested) return { aborted:true };
+    shuffleArray(trainData);
+    let loss=0, correct=0, processed=0;
+    annZeroGrad();
+    for (let si=0; si<trainData.length; si++){
+      if (stopRequested) return { aborted:true };
+      const norm = trainData[si].buf.slice(); normalizeInput(norm);
+      annForward(norm);
+      const label = trainData[si].label;
+      loss += -Math.log(Math.max(annFinal[label],1e-7));
+      let pred=0; for (let j=1;j<NUM_CLASSES;j++) if (annFinal[j]>annFinal[pred]) pred=j;
+      if (pred===label) correct++;
+      annBackward(norm,label);
+      classEverTrained[label]=true;
+      processed++;
+      if ((si+1)%BATCH_SIZE===0 || si===trainData.length-1){
+        const sc=1/processed;
+        for (const k in AnnGrad) if (AnnGrad[k] instanceof Float32Array) scaleArray(AnnGrad[k], sc);
+        annApplyAdamBatch();
+        annZeroGrad(); processed=0;
+      }
+      if (si%8===0) await sleep(0);
+    }
+    const trainAcc = 100*correct/nTrain;
+    let valAcc=0;
+    if (valData.length>0){
+      let vc=0;
+      for (const vi of valData){ const norm=vi.buf.slice(); normalizeInput(norm); annForward(norm); let p=0; for (let j=1;j<NUM_CLASSES;j++) if (annFinal[j]>annFinal[p]) p=j; if (p===vi.label) vc++; }
+      valAcc = 100*vc/valData.length;
+    }
+    const score = valData.length>0?valAcc:trainAcc;
+    const isBest = score>bestAcc;
+    if (isBest){ bestAcc=score; bestEpoch=epoch+1; }
+    log(`[${tag}] Epoch ${epoch+1}/${TARGET_EPOCHS} Loss=${(loss/nTrain).toFixed(4)} TrainAcc=${trainAcc.toFixed(1)}% ValAcc=${valAcc.toFixed(1)}%${isBest?'  <- best so far':''}`);
+    updateTrainProgress(epoch+1, TARGET_EPOCHS, trainAcc, valAcc);
+    await sleep(0);
+  }
+  Ann.trained = true;
+  await annSaveWeights();
+  log(`[${tag}] Done. Best ${valData.length>0?'ValAcc':'TrainAcc'}=${bestAcc.toFixed(1)}% at epoch ${bestEpoch}. Weights saved.`);
+  return { aborted:false, bestAcc, bestEpoch };
+}
+async function actionTrainAnn(continuous){
+  const tag = continuous ? 'ANN-auto' : 'ANN';
+  const { trainingData, counts } = await buildTrainingList();
+  log(`[${tag}] Samples found: ` + CLASSES.map((c,i)=>`${c.label}=${counts[i]}${counts[i]===0?'(empty)':''}`).join(' '));
+  if (trainingData.length===0){ log(`[${tag}] No training samples - collect data first.`); return; }
+  await refreshActiveClassMask();
+  const { valData, trainData } = splitValidation(trainingData);
+  log(`[${tag}] Training on ${trainData.length} gestures, holding out ${valData.length} for validation. ${TARGET_EPOCHS} epochs/loop, lr=${LEARNING_RATE}, batch=${BATCH_SIZE}.`);
+  stopRequested = false;
+  showProgress(true);
+  if (!continuous){
+    const res = await trainAnnOnce(trainData, valData, tag);
+    if (res.aborted) log(`[${tag}] Stopped - nothing saved for this run.`);
+    showProgress(false);
+    return;
+  }
+  let loopNo=0, savedLoops=0;
+  while (!stopRequested){
+    loopNo++;
+    log(`[ANN-auto] ---- Loop ${loopNo} starting ----`);
+    const res = await trainAnnOnce(trainData, valData, tag);
+    if (res.aborted){ log(`[ANN-auto] Stopped. Loop ${loopNo} discarded. ${savedLoops} loop(s) saved.`); break; }
+    savedLoops++;
+    log(`[ANN-auto] Loop ${loopNo} complete (${savedLoops} saved so far).`);
+  }
+  showProgress(false);
+}
+
+// ======================================================================
+// ACTIONS: SNN TRAIN
+// ======================================================================
+async function trainSnnOnce(trainData, valData, tag){
+  const nTrain = Math.max(trainData.length,1);
+  let bestAcc=-1, bestEpoch=-1;
+  const tmp = new Float32Array(SNN_CHANNELS);
+  for (let epoch=0; epoch<TARGET_EPOCHS; epoch++){
+    if (stopRequested) return { aborted:true };
+    shuffleArray(trainData);
+    let lossSum=0, correct=0, inBatch=0;
+    snnZeroGrad();
+    for (let si=0; si<trainData.length; si++){
+      if (stopRequested) return { aborted:true };
+      const raw = trainData[si].buf.slice();
+      snnEncodeFromRaw(raw, true);
+      snnResetStreamState();
+      const label = trainData[si].label;
+      let pred=0;
+      for (let t=0;t<IMU_TIMESTEPS;t++){
+        tmp.set(snnSpikeInput.subarray(t*SNN_CHANNELS,(t+1)*SNN_CHANNELS));
+        pred = snnTick(tmp, true, t);
+      }
+      if (pred===label) correct++;
+      lossSum += snnBackwardBPTT(label);
+      classEverTrained[label]=true;
+      inBatch++;
+      if (inBatch>=BATCH_SIZE || si===trainData.length-1){
+        snnScaleGrad(1/inBatch);
+        snnApplyAdam();
+        snnZeroGrad(); inBatch=0;
+      }
+      if (si%4===0) await sleep(0);
+    }
+    const trainAcc = 100*correct/nTrain;
+    let valAcc=0;
+    if (valData.length>0){
+      let vc=0;
+      for (const vi of valData){
+        const raw = vi.buf.slice();
+        snnEncodeFromRaw(raw, false);
+        snnResetStreamState();
+        let pred=0;
+        for (let t=0;t<IMU_TIMESTEPS;t++){
+          tmp.set(snnSpikeInput.subarray(t*SNN_CHANNELS,(t+1)*SNN_CHANNELS));
+          pred = snnTick(tmp, false, 0);
+        }
+        if (pred===vi.label) vc++;
+      }
+      valAcc = 100*vc/valData.length;
+    }
+    const score = valData.length>0?valAcc:trainAcc;
+    const isBest = score>bestAcc;
+    if (isBest){ bestAcc=score; bestEpoch=epoch+1; }
+    log(`[${tag}] Epoch ${epoch+1}/${TARGET_EPOCHS} Loss=${(lossSum/nTrain).toFixed(4)} TrainAcc=${trainAcc.toFixed(1)}% ValAcc=${valAcc.toFixed(1)}%${isBest?' <- best so far':''} (spikes c1=${streamConv1Spikes} d1=${streamDense1Spikes} d2=${streamDense2Spikes})`);
+    updateTrainProgress(epoch+1, TARGET_EPOCHS, trainAcc, valAcc);
+    await sleep(0);
+  }
+  Snn.trained = true;
+  await snnSaveWeights();
+  log(`[${tag}] Done. Best ${valData.length>0?'ValAcc':'TrainAcc'}=${bestAcc.toFixed(1)}% at epoch ${bestEpoch}. Weights saved.`);
+  return { aborted:false, bestAcc, bestEpoch };
+}
+async function actionTrainSnn(continuous){
+  const tag = continuous ? 'SNN-auto' : 'SNN';
+  const { trainingData, counts } = await buildTrainingList();
+  log(`[${tag}] Samples found: ` + CLASSES.map((c,i)=>`${c.label}=${counts[i]}${counts[i]===0?'(empty)':''}`).join(' '));
+  if (trainingData.length===0){ log(`[${tag}] No training samples - collect data first.`); return; }
+  await refreshActiveClassMask();
+  const { valData, trainData } = splitValidation(trainingData);
+  log(`[${tag}] Training on ${trainData.length} gestures, holding out ${valData.length} for validation.`);
+  stopRequested = false;
+  showProgress(true);
+  if (!continuous){
+    const res = await trainSnnOnce(trainData, valData, tag);
+    if (res.aborted) log(`[${tag}] Stopped - nothing saved for this run.`);
+    showProgress(false);
+    return;
+  }
+  let loopNo=0, savedLoops=0;
+  while (!stopRequested){
+    loopNo++;
+    log(`[SNN-auto] ---- Loop ${loopNo} starting ----`);
+    const res = await trainSnnOnce(trainData, valData, tag);
+    if (res.aborted){ log(`[SNN-auto] Stopped. Loop ${loopNo} discarded. ${savedLoops} loop(s) saved.`); break; }
+    savedLoops++;
+    log(`[SNN-auto] Loop ${loopNo} complete (${savedLoops} saved so far).`);
+  }
+  showProgress(false);
+}
+
+// ======================================================================
+// ACTIONS: INFERENCE
+// ======================================================================
+async function actionInferAnn(){
+  if (!Ann.trained){ log('[ANN] No trained weights yet - run Train ANN first.'); return; }
+  await refreshActiveClassMask();
+  resetOutputDebounceAnn();
+  stopRequested = false;
+  log('[ANN] Move the phone. Tap STOP to return.');
+  let windowCount=0;
+  while (!stopRequested){
+    const raw = new Float32Array(IMU_TIMESTEPS*IMU_AXES);
+    await sampleGesture((t,v)=>{ raw[t*IMU_AXES]=v[0]; raw[t*IMU_AXES+1]=v[1]; raw[t*IMU_AXES+2]=v[2]; });
+    if (stopRequested) break;
+    const norm = raw.slice(); normalizeInput(norm);
+    annForward(norm);
+    const pred = argmaxActive(annFinal);
+    const prob = annFinal[pred];
+    windowCount++;
+    updateOutputStringAnn(pred, prob);
+    if (verboseInfer) log(`[ANN] #${windowCount} pred=${CLASSES[pred].label} p=${prob.toFixed(2)}${prob<ANN_COMMIT_MIN_PROB?' (too unsure, not typed)':''}`);
+  }
+  log(`[ANN] Exiting after ${windowCount} windows.`);
+}
+async function actionInferSnnContinuous(){
+  if (!Snn.trained){ log('[SNN] No trained weights yet - run Train SNN or Train+Infer SNN first.'); return; }
+  await refreshActiveClassMask();
+  resetGestureState();
+  snnResetStreamState();
+  const enc = makeSpikeEncoder();
+  stopRequested = false;
+  log('[SNN] Draw a letter, then pause - it commits once the gesture ends. Tap STOP to return.');
+  let tickCount=0;
+  const spikeTmp = new Float32Array(SNN_CHANNELS);
+  while (!stopRequested){
+    const tS = performance.now();
+    enc.step(readAccelG(), spikeTmp);
+    snnTick(spikeTmp, false, 0);   // the SNN always streams, regardless of gesture state
+    tickCount++;
+    gestureTick(spikeTmp, tickCount);   // decides START/ACTIVE/END/COMMIT
+    const el = performance.now()-tS;
+    if (el<SAMPLE_INTERVAL_MS) await sleep(SAMPLE_INTERVAL_MS-el);
+  }
+  log(`[SNN-live] Exiting after ${tickCount} ticks.`);
+}
+async function actionTrainInferSnnOnce(){
+  log(`[SNN Train+Infer] Labeling this gesture as '${CLASSES[collectClassIdx].label}' (open a class above first to change).`);
+  snnResetStreamState();
+  const enc = makeSpikeEncoder();
+  const label = collectClassIdx;
+  let lastPred=0;
+  const tmp = new Float32Array(SNN_CHANNELS);
+  for (let t=0;t<IMU_TIMESTEPS;t++){
+    const tS = performance.now();
+    enc.step(readAccelG(), tmp);
+    snnSpikeInput.set(tmp, t*SNN_CHANNELS);
+    lastPred = snnTick(tmp, true, t);
+    if (verboseInfer && t%5===0) log(`  live tick ${t} -> ${CLASSES[lastPred].label}`);
+    const el = performance.now()-tS; if (el<SAMPLE_INTERVAL_MS) await sleep(SAMPLE_INTERVAL_MS-el);
+  }
+  snnZeroGrad();
+  snnBackwardBPTT(label);
+  snnApplyAdam();
+  classEverTrained[label]=true;
+  await refreshActiveClassMask();
+  Snn.trained = true;
+  await snnSaveWeights();
+  log(`[SNN Train+Infer] Done. Labeled=${CLASSES[label].label} LivePredAtEnd=${CLASSES[lastPred].label} (${lastPred===label?'OK':'MISS'})`);
+}
+
+// ======================================================================
+// STATUS
+// ======================================================================
+async function printStatus(){
+  await refreshActiveClassMask();
+  let s = '=== STATUS ===\n';
+  s += 'Samples per class: ';
+  for (let c=0;c<NUM_CLASSES;c++){ const n = await Store.countSamples(c); s += `${CLASSES[c].label}=${n}${n===0?'(empty)':''} `; }
+  s += '\nActive for prediction: ';
+  for (let c=0;c<NUM_CLASSES;c++) if (activeClassMask[c]) s += CLASSES[c].label+' ';
+  s += `\nANN: trained=${Ann.trained} freeze conv1=${Ann.freezeConv1} dense1=${Ann.freezeDense1} dense2=${Ann.freezeDense2} output=${Ann.freezeOutput} adamStep=${Ann.adamStep}`;
+  s += `\nSNN: trained=${Snn.trained} freeze conv1=${Snn.freezeConv1} dense1=${Snn.freezeDense1} dense2=${Snn.freezeDense2} output=${Snn.freezeOutput} adamStep=${Snn.adamStep}`;
+  s += `\nTraining: lr=${LEARNING_RATE} batch=${BATCH_SIZE} epochs/loop=${TARGET_EPOCHS} valSamples=${VALIDATION_SAMPLES}`;
+  s += `\nSNN params: LIF_THRESHOLD=${LIF_THRESHOLD} LIF_LEAK=${LIF_LEAK} SNN_TRACE_LEAK=${SNN_TRACE_LEAK} SPIKE_DELTA_G=${SPIKE_DELTA_G}`;
+  s += `\nOutput engine (SNN gestures): onset=${GESTURE_ONSET_TICKS} endStill=${GESTURE_END_STILL_TICKS} min=${MIN_GESTURE_TICKS} max=${MAX_GESTURE_TICKS} finalPortion=${FINAL_PORTION_TICKS}(w=${GESTURE_FINAL_WEIGHT}) minProb=${GESTURE_COMMIT_MIN_PROB} margin=${GESTURE_COMMIT_MARGIN} settle=${RESET_SETTLE_TICKS} stillHold=${STILL_HOLD_TICKS}`;
+  s += `\nOutput engine (ANN): minProb=${ANN_COMMIT_MIN_PROB} confirm=${ANN_CONFIRM_WINDOWS} | Delete repeat=${DELETE_REPEAT_MS}ms`;
+  s += `\nTranscript: "${outputString}"`;
+  s += `\nStorage: ${Store.mode==='fs' ? 'real folder ('+(Store.rootHandle?Store.rootHandle.name:'?')+')' : 'in-browser (IndexedDB) - use Export for real files'}`;
+  s += '\n==============';
+  log(s);
+}
+
+// Loads ANN/SNN weights and calibration from whatever Store currently points
+// at (the chosen real folder, or IndexedDB). Used at page load and again
+// whenever the person points the page at a (possibly different) real folder,
+// so existing header/ binaries in that folder are picked up automatically -
+// no manual "Upload" step needed.
+async function loadModelsAndCalibFromStore(){
+  const annLoaded = await annLoadWeights();
+  const snnLoaded = await snnLoadWeights();
+  const calibBuf = await Store.readWeightFile(CALIB_FILE);
+  let calibLoaded = false;
+  if (calibBuf && calibBuf.byteLength===24){
+    const dv = new DataView(calibBuf);
+    for (let a=0;a<3;a++) myAccelMean[a]=dv.getFloat32(a*4,true);
+    for (let a=0;a<3;a++) myAccelStd[a]=dv.getFloat32(12+a*4,true);
+    calibLoaded = true;
+  }
+  return { annLoaded, snnLoaded, calibLoaded };
+}
+
+// ======================================================================
+// UI WIRING
+// ======================================================================
+function buildClassGrid(){
+  const grid = document.getElementById('classGrid');
+  grid.innerHTML = '';
+  Promise.all(CLASSES.map((c,i)=>Store.countSamples(i))).then(counts=>{
+    CLASSES.forEach((c,i)=>{
+      const b = document.createElement('button');
+      b.className = 'classBtn'+(counts[i]===0?' empty':'');
+      b.innerHTML = c.label + `<span class="count">${counts[i]}</span>`;
+      b.onclick = ()=>openCollect(i);
+      grid.appendChild(b);
+    });
+  });
+}
+function buildSettingsUI(){
+  const defs = [
+    ['Learning rate', ()=>LEARNING_RATE, v=>LEARNING_RATE=v, 0.0001],
+    ['Batch size', ()=>BATCH_SIZE, v=>BATCH_SIZE=Math.round(v), 1],
+    ['Epochs per loop', ()=>TARGET_EPOCHS, v=>TARGET_EPOCHS=Math.round(v), 1],
+    ['Validation samples/class', ()=>VALIDATION_SAMPLES, v=>VALIDATION_SAMPLES=Math.round(v), 1],
+    ['SNN spike delta (g)', ()=>SPIKE_DELTA_G, v=>SPIKE_DELTA_G=v, 0.001],
+    ['SNN LIF leak', ()=>LIF_LEAK, v=>LIF_LEAK=v, 0.01],
+    ['SNN LIF threshold', ()=>LIF_THRESHOLD, v=>LIF_THRESHOLD=v, 0.01],
+    ['SNN trace leak', ()=>SNN_TRACE_LEAK, v=>SNN_TRACE_LEAK=v, 0.01],
+    ['Gesture onset ticks', ()=>GESTURE_ONSET_TICKS, v=>GESTURE_ONSET_TICKS=Math.round(v), 1],
+    ['Gesture end-still ticks', ()=>GESTURE_END_STILL_TICKS, v=>GESTURE_END_STILL_TICKS=Math.round(v), 1],
+    ['Min gesture ticks', ()=>MIN_GESTURE_TICKS, v=>MIN_GESTURE_TICKS=Math.round(v), 1],
+    ['Max gesture ticks', ()=>MAX_GESTURE_TICKS, v=>MAX_GESTURE_TICKS=Math.round(v), 1],
+    ['Final portion ticks', ()=>FINAL_PORTION_TICKS, v=>FINAL_PORTION_TICKS=Math.round(v), 1],
+    ['Final portion weight', ()=>GESTURE_FINAL_WEIGHT, v=>GESTURE_FINAL_WEIGHT=v, 0.05],
+    ['Reset settle ticks', ()=>RESET_SETTLE_TICKS, v=>RESET_SETTLE_TICKS=Math.round(v), 1],
+    ['Gesture commit min prob', ()=>GESTURE_COMMIT_MIN_PROB, v=>GESTURE_COMMIT_MIN_PROB=v, 0.01],
+    ['Gesture commit margin', ()=>GESTURE_COMMIT_MARGIN, v=>GESTURE_COMMIT_MARGIN=v, 0.01],
+    ['Still hold ticks', ()=>STILL_HOLD_TICKS, v=>STILL_HOLD_TICKS=Math.round(v), 1],
+    ['Delete repeat (ms)', ()=>DELETE_REPEAT_MS, v=>DELETE_REPEAT_MS=Math.round(v), 10],
+    ['ANN commit min prob', ()=>ANN_COMMIT_MIN_PROB, v=>ANN_COMMIT_MIN_PROB=v, 0.01],
+    ['ANN confirm windows', ()=>ANN_CONFIRM_WINDOWS, v=>ANN_CONFIRM_WINDOWS=Math.round(v), 1],
+  ];
+  const grid = document.getElementById('settingsGrid');
+  for (const [label, get, set, step] of defs){
+    const lab = document.createElement('div'); lab.textContent = label;
+    const inp = document.createElement('input');
+    inp.type='number'; inp.step=step; inp.value=get();
+    inp.onchange = ()=>set(parseFloat(inp.value));
+    grid.appendChild(lab); grid.appendChild(inp);
+  }
+}
+function buildViewerUI(){
+  const sel = document.getElementById('viewClassSelect');
+  sel.innerHTML = CLASSES.map((c,i)=>`<option value="${i}">${c.label}</option>`).join('');
+  sel.onchange = refreshRepDropdown;
+  refreshRepDropdown();
+}
+function updateDeleteRepButton(){
+  const repSel = document.getElementById('viewRepSelect').value;
+  document.getElementById('btnDeleteRep').disabled = (repSel==='all' || repSel===undefined || repSel==='');
+}
+async function refreshRepDropdown(){
+  const classIdx = parseInt(document.getElementById('viewClassSelect').value)||0;
+  const items = await Store.listSamples(classIdx);
+  const sel = document.getElementById('viewRepSelect');
+  sel.innerHTML = '<option value="all">All reps (ax overlay)</option>' +
+    items.map((it,i)=>`<option value="${i}">${it.name}</option>`).join('');
+  updateDeleteRepButton();
+}
+// Deletes only the single rep currently chosen in the dropdown - "All reps" is
+// disabled on the button on purpose, so this can never wipe a whole class.
+async function deleteSelectedRep(){
+  const classIdx = parseInt(document.getElementById('viewClassSelect').value)||0;
+  const repSel = document.getElementById('viewRepSelect').value;
+  if (repSel==='all') return;
+  const items = await Store.listSamples(classIdx);
+  const it = items[parseInt(repSel)];
+  if (!it) return;
+  if (!confirm(`Delete ${CLASSES[classIdx].label} / ${it.name}? This cannot be undone.`)) return;
+  await Store.deleteSample(classIdx, it.name);
+  log(`[Delete] Removed ${it.name} from '${CLASSES[classIdx].label}'.`);
+  document.getElementById('plotlyDiv').innerHTML = '';
+  await refreshActiveClassMask();
+  buildClassGrid();
+  await refreshRepDropdown();
+}
+async function renderPlot(){
+  const classIdx = parseInt(document.getElementById('viewClassSelect').value)||0;
+  const repSel = document.getElementById('viewRepSelect').value;
+  const items = await Store.listSamples(classIdx);
+  if (items.length===0){ log('No samples to plot for this class yet.'); return; }
+  const t = Array.from({length:IMU_TIMESTEPS},(_,i)=>i*SAMPLE_INTERVAL_MS);
+  if (repSel==='all'){
+    const traces = items.map(it=>{
+      const buf=parseCsv(it.text);
+      const xs=[]; for (let k=0;k<IMU_TIMESTEPS;k++) xs.push(buf[k*3]);
+      return { x:t, y:xs, name:it.name, mode:'lines' };
+    });
+    Plotly.newPlot('plotlyDiv', traces, { title:`${CLASSES[classIdx].label}: ax across ${items.length} reps`, xaxis:{title:'ms'}, yaxis:{title:'ax (g)'}, height:380, margin:{t:40} });
+  } else {
+    const it = items[parseInt(repSel)];
+    const buf = parseCsv(it.text);
+    const xs=[],ys=[],zs=[];
+    for (let k=0;k<IMU_TIMESTEPS;k++){ xs.push(buf[k*3]); ys.push(buf[k*3+1]); zs.push(buf[k*3+2]); }
+    const traces = [
+      { x:t, y:xs, name:'ax', mode:'lines' },
+      { x:t, y:ys, name:'ay', mode:'lines' },
+      { x:t, y:zs, name:'az', mode:'lines' },
+    ];
+    Plotly.newPlot('plotlyDiv', traces, { title:`${CLASSES[classIdx].label} - ${it.name}`, xaxis:{title:'ms'}, yaxis:{title:'g'}, height:380, margin:{t:40} });
+  }
+}
+
+function wireUI(){
+  document.getElementById('btnEnableMotion').onclick = enableMotionSensors;
+  document.getElementById('btnCalibrate').onclick = async ()=>{ setBusy(true); await calibrate(); setBusy(false); };
+  document.getElementById('btnChooseFolder').onclick = async ()=>{
+    const ok = await Store.chooseFolder();
+    if (ok){
+      const { annLoaded, snnLoaded, calibLoaded } = await loadModelsAndCalibFromStore();
+      log(`[Folder] Auto-loaded from header/: ${annLoaded?'ANN weights':'no ANN weights'}, ${snnLoaded?'SNN weights':'no SNN weights'}, ${calibLoaded?'calibration':'no calibration'}.`);
+      await refreshActiveClassMask();
+    }
+    buildClassGrid();
+  };
+  document.getElementById('btnExportZip').onclick = exportAllZip;
+  document.getElementById('fileImportZip').onchange = async (e)=>{ if (e.target.files[0]){ setBusy(true); await importZipFile(e.target.files[0]); setBusy(false); e.target.value=''; } };
+
+  document.getElementById('btnClearTranscript').onclick = ()=>{ outputString=''; onOutputChanged(); };
+
+  document.getElementById('btnCaptureOne').onclick = async ()=>{ setBusy(true); await captureOneSample(collectClassIdx); setBusy(false); };
+  document.getElementById('btnAutoCollect').onclick = async ()=>{ setBusy(true); await autoCollect(collectClassIdx, 10); setBusy(false); };
+  document.getElementById('fileImportCsv').onchange = async (e)=>{ if (e.target.files.length){ setBusy(true); await importCsvFilesForClass(collectClassIdx, Array.from(e.target.files)); setBusy(false); e.target.value=''; } };
+  document.getElementById('btnCloseCollect').onclick = ()=>{ document.getElementById('collectPanel').classList.add('hidden'); };
+
+  document.getElementById('btnTrainAnn').onclick = async ()=>{ setBusy(true); await actionTrainAnn(false); setBusy(false); buildClassGrid(); };
+  document.getElementById('btnAutoTrainAnn').onclick = async ()=>{ setBusy(true); await actionTrainAnn(true); setBusy(false); buildClassGrid(); };
+  document.getElementById('btnInferAnn').onclick = async ()=>{ setBusy(true); await actionInferAnn(); setBusy(false); };
+  document.getElementById('btnTrainSnn').onclick = async ()=>{ setBusy(true); await actionTrainSnn(false); setBusy(false); buildClassGrid(); };
+  document.getElementById('btnAutoTrainSnn').onclick = async ()=>{ setBusy(true); await actionTrainSnn(true); setBusy(false); buildClassGrid(); };
+  document.getElementById('btnInferSnn').onclick = async ()=>{ setBusy(true); await actionInferSnnContinuous(); setBusy(false); };
+  document.getElementById('btnTrainInferSnn').onclick = async ()=>{ setBusy(true); await actionTrainInferSnnOnce(); setBusy(false); };
+
+  document.getElementById('btnStop').onclick = ()=>{ stopRequested = true; };
+  document.getElementById('chkVerbose').onchange = (e)=>{ verboseInfer = e.target.checked; };
+  document.getElementById('btnStatus').onclick = printStatus;
+
+  document.getElementById('btnDownloadAnn').onclick = ()=>downloadWeightFile(ANN_WEIGHT_FILE);
+  document.getElementById('btnDownloadSnn').onclick = ()=>downloadWeightFile(SNN_WEIGHT_FILE);
+  document.getElementById('fileUploadAnn').onchange = async (e)=>{ if (e.target.files[0]){ await uploadWeightFile(ANN_WEIGHT_FILE, e.target.files[0]); e.target.value=''; } };
+  document.getElementById('fileUploadSnn').onchange = async (e)=>{ if (e.target.files[0]){ await uploadWeightFile(SNN_WEIGHT_FILE, e.target.files[0]); e.target.value=''; } };
+
+  document.getElementById('frzSnnC1').onchange = e=>Snn.freezeConv1=e.target.checked;
+  document.getElementById('frzSnnD1').onchange = e=>Snn.freezeDense1=e.target.checked;
+  document.getElementById('frzSnnD2').onchange = e=>Snn.freezeDense2=e.target.checked;
+  document.getElementById('frzSnnOut').onchange = e=>Snn.freezeOutput=e.target.checked;
+  document.getElementById('frzAnnC1').onchange = e=>Ann.freezeConv1=e.target.checked;
+  document.getElementById('frzAnnD1').onchange = e=>Ann.freezeDense1=e.target.checked;
+  document.getElementById('frzAnnD2').onchange = e=>Ann.freezeDense2=e.target.checked;
+  document.getElementById('frzAnnOut').onchange = e=>Ann.freezeOutput=e.target.checked;
+
+  document.getElementById('btnRenderPlot').onclick = renderPlot;
+  document.getElementById('viewRepSelect').addEventListener('change', updateDeleteRepButton);
+  document.getElementById('btnDeleteRep').onclick = deleteSelectedRep;
+}
+
+// ======================================================================
+// INIT
+// ======================================================================
+window.addEventListener('DOMContentLoaded', async ()=>{
+  allocRecording();
+  annInit();
+  snnInit();
+  wireUI();
+  await Store.init();
+  const { annLoaded, snnLoaded } = await loadModelsAndCalibFromStore();
+  await refreshActiveClassMask();
+  buildClassGrid();
+  buildSettingsUI();
+  buildViewerUI();
+  log('Ready. ' + (annLoaded?'ANN weights loaded. ':'No ANN weights yet. ') + (snnLoaded?'SNN weights loaded.':'No SNN weights yet.'));
+  log('1) Enable Motion Sensors  2) Calibrate (hold still)  3) tap a class to collect gestures.');
+});
+</script>
+</body>
+</html>
