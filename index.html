@@ -207,6 +207,7 @@ Use at your own risk! MIT license.
     </div>
     <div class="row" style="margin-top:8px;">
       <label><input type="checkbox" id="chkVerbose" checked> Verbose logging</label>
+      <label><input type="checkbox" id="chkSkipValidation"> Train on all samples (skip validation)</label>
       <button id="btnStatus">Status</button>
     </div>
   </div>
@@ -352,6 +353,7 @@ const SNN_WEIGHT_FILE = 'mySnnWeightsV15.bin';
 const CALIB_FILE = 'myCalib.bin';
 
 let verboseInfer = true;
+let skipValidation = false;
 let stopRequested = false;
 let myAccelMean = [0,0,1], myAccelStd = [1,1,1];
 let activeClassMask = new Array(NUM_CLASSES).fill(true);
@@ -1465,18 +1467,29 @@ async function buildTrainingList(){
   }
   return { trainingData, counts };
 }
+// Splits off up to VALIDATION_SAMPLES per class for testing (0, or the "skip
+// validation" checkbox, trains on everything). Whatever VALIDATION_SAMPLES
+// says, a class is never left with zero training examples just to satisfy
+// the holdout - a class with N samples never holds out more than N-1, so a
+// class you've only collected once still gets trained on. `capped` reports
+// whether that safety cap actually kicked in for any class, for logging.
 function splitValidation(trainingData){
   shuffleArray(trainingData);
+  const wantPerClass = skipValidation ? 0 : VALIDATION_SAMPLES;
+  if (wantPerClass<=0) return { valData: [], trainData: trainingData, capped:false };
+
+  const totalPerClass = {};
+  for (const it of trainingData) totalPerClass[it.label] = (totalPerClass[it.label]||0)+1;
   const held = new Array(NUM_CLASSES).fill(0);
   const valData=[], trainOnly=[];
-  if (VALIDATION_SAMPLES>0){
-    for (const it of trainingData){
-      if (held[it.label]<VALIDATION_SAMPLES){ valData.push(it); held[it.label]++; }
-      else trainOnly.push(it);
-    }
-    return { valData, trainData: trainOnly };
+  let capped = false;
+  for (const it of trainingData){
+    const cap = Math.max(0, (totalPerClass[it.label]||0) - 1);   // always leave >=1 to train on
+    if (cap < wantPerClass) capped = true;
+    if (held[it.label] < Math.min(wantPerClass, cap)){ valData.push(it); held[it.label]++; }
+    else trainOnly.push(it);
   }
-  return { valData: [], trainData: trainingData };
+  return { valData, trainData: trainOnly, capped };
 }
 
 // ======================================================================
@@ -1534,8 +1547,9 @@ async function actionTrainAnn(continuous){
   log(`[${tag}] Samples found: ` + CLASSES.map((c,i)=>`${c.label}=${counts[i]}${counts[i]===0?'(empty)':''}`).join(' '));
   if (trainingData.length===0){ log(`[${tag}] No training samples - collect data first.`); return; }
   await refreshActiveClassMask();
-  const { valData, trainData } = splitValidation(trainingData);
+  const { valData, trainData, capped } = splitValidation(trainingData);
   log(`[${tag}] Training on ${trainData.length} gestures, holding out ${valData.length} for validation. ${TARGET_EPOCHS} epochs/loop, lr=${LEARNING_RATE}, batch=${BATCH_SIZE}.`);
+  if (capped) log(`[${tag}] Note: some classes had too few samples to hold out ${VALIDATION_SAMPLES} for validation - held out fewer so at least one example stays in training for those classes.`);
   stopRequested = false;
   showProgress(true);
   if (!continuous){
@@ -1625,8 +1639,9 @@ async function actionTrainSnn(continuous){
   log(`[${tag}] Samples found: ` + CLASSES.map((c,i)=>`${c.label}=${counts[i]}${counts[i]===0?'(empty)':''}`).join(' '));
   if (trainingData.length===0){ log(`[${tag}] No training samples - collect data first.`); return; }
   await refreshActiveClassMask();
-  const { valData, trainData } = splitValidation(trainingData);
+  const { valData, trainData, capped } = splitValidation(trainingData);
   log(`[${tag}] Training on ${trainData.length} gestures, holding out ${valData.length} for validation.`);
+  if (capped) log(`[${tag}] Note: some classes had too few samples to hold out ${VALIDATION_SAMPLES} for validation - held out fewer so at least one example stays in training for those classes.`);
   stopRequested = false;
   showProgress(true);
   if (!continuous){
@@ -1901,6 +1916,7 @@ function wireUI(){
 
   document.getElementById('btnStop').onclick = ()=>{ stopRequested = true; };
   document.getElementById('chkVerbose').onchange = (e)=>{ verboseInfer = e.target.checked; };
+  document.getElementById('chkSkipValidation').onchange = (e)=>{ skipValidation = e.target.checked; };
   document.getElementById('btnStatus').onclick = printStatus;
 
   document.getElementById('btnDownloadAnn').onclick = ()=>downloadWeightFile(ANN_WEIGHT_FILE);
