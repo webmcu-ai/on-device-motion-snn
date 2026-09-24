@@ -2,6 +2,9 @@
 
 # Releases
 
+Sept 23 test v26 both index and firmware.
+
+
 Sept 22, 2026  Firmware.ino based on imu-snn-v022.ino
 
 index.html based on index-v023.html
