@@ -3,15 +3,25 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>IMU Air-Writing Trainer (browser, v023)</title>
+<title>IMU Air-Writing Trainer (browser, v024)</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <!--
 ======================================================================
 IMU AIR-WRITING TRAINER - BROWSER EDITION
-index-v023.html
+index-v024.html
+
+WHAT'S NEW IN v024
+  The SNN's output engine no longer commits from a fixed sliding window.
+  It now mirrors the device's gesture segmentation: draw a letter, pause,
+  and only then does it commit - see OUTPUT ENGINE / gestureTick() below.
+  "Still" (space) is now a timeout on sustained stillness rather than a
+  class the SNN has to recognise mid-gesture. Also fixed a zip-import crash
+  on folder entries, added a way to delete a single collected rep, and
+  choosing a real folder now auto-loads any ANN/SNN weights and calibration
+  already in its header/ subfolder.
 
 WHAT IT DOES
-  Runs the same two classifiers as the on-device firmware (imu-snn-v022.ino)
+  Runs the same two classifiers as the on-device firmware (imu-snn-v024.ino)
   directly in a phone's browser, using the phone's own accelerometer instead
   of the XIAO ESP32S3's IMU. Training on a phone's CPU is much faster than
   the microcontroller, and there's no SD card or Serial Monitor to fuss with.
@@ -27,8 +37,8 @@ WHAT IT DOES
         versa via "Upload ANN weights". Same for the SNN's
         mySnnWeightsV15.bin.
     (b) the architecture, training math, and output engine (Still/Delete/
-        letter commit logic, cooldowns, windowing) behave identically to
-        the device, so a model trained here predicts the same way there.
+        letter commit logic and gesture segmentation) behave identically
+        to the device, so a model trained here predicts the same way there.
   A generic framework would fight both of these - this custom architecture
   has no ready-made equivalent, and even if it did, its weight format
   would not match the device's raw float32 layout.
@@ -75,7 +85,11 @@ Use at your own risk! MIT license.
     margin:0; background:var(--bg); color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+    transition: background-color 0.15s ease;
   }
+  /* Data-collection cue: amber while getting ready, green while actually recording. */
+  body.collect-ready{ background-color:var(--warn); }
+  body.collect-recording{ background-color:var(--accent2); }
   #app{max-width:640px; margin:0 auto; padding:12px 12px 90px 12px;}
   h1{font-size:1.15rem; margin:8px 0 2px 0;}
   h2{font-size:0.95rem; margin:0 0 8px 0; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;}
@@ -129,8 +143,8 @@ Use at your own risk! MIT license.
 <body>
 <div id="app">
 
-  <h1>IMU Air-Writing Trainer <span class="small">- browser edition, v023</span></h1>
-  <p class="small">Companion to <b>imu-snn-v022.ino</b>. Trains the same ANN/SNN models on this phone's
+  <h1>IMU Air-Writing Trainer <span class="small">- browser edition, v024</span></h1>
+  <p class="small">Companion to <b>imu-snn-v024.ino</b>. Trains the same ANN/SNN models on this phone's
   accelerometer; weight files are byte-compatible with the on-device firmware. Requires HTTPS (or
   localhost) for motion sensor access.</p>
 
@@ -241,6 +255,7 @@ Use at your own risk! MIT license.
       <select id="viewClassSelect"></select>
       <select id="viewRepSelect"></select>
       <button id="btnRenderPlot">Render</button>
+      <button id="btnDeleteRep" class="danger" disabled>Delete Selected</button>
     </div>
     <div id="plotlyDiv"></div>
   </details>
@@ -258,7 +273,7 @@ Use at your own risk! MIT license.
 'use strict';
 
 // ======================================================================
-// CONFIG - mirrors the CONFIGURATION section of imu-snn-v022.ino
+// CONFIG - mirrors the CONFIGURATION section of imu-snn-v024.ino
 // ======================================================================
 const CLASSES = [
   { label:"Still",  folder:"0Still"  },
@@ -273,6 +288,7 @@ const CLASSES = [
   { label:"E",      folder:"9E"      },
 ];
 const NUM_CLASSES = CLASSES.length;
+const STILL_CLASS_IDX = CLASSES.findIndex(c=>c.label==='Still'); // -1 if no such class
 
 const IMU_TIMESTEPS = 40;
 const IMU_AXES = 3;
@@ -312,10 +328,19 @@ const TRAIN_LOSS_FROM_TICK = 16;
 const AUG_MAX_SHIFT = 4;
 const AUG_GAIN_RANGE = 0.15;
 
-let WINDOW_TICKS = 20;
-let COMMIT_MIN_PROB = 0.55;
-let COMMIT_MARGIN = 0.25;
-let COOLDOWN_TICKS = 20;
+// SNN output engine: gesture segmentation (mirrors GESTURE_* in the firmware).
+// The SNN predicts every tick, but nothing is typed until a full gesture -
+// movement, then stillness - has been seen. See gestureTick()/classifyGesture().
+let GESTURE_ONSET_TICKS = 3;      // consecutive moving ticks before a gesture is considered STARTED
+let GESTURE_END_STILL_TICKS = 8;  // consecutive still ticks before a gesture is considered FINISHED
+let MIN_GESTURE_TICKS = 12;       // gestures shorter than this are ignored as noise, not a letter
+let MAX_GESTURE_TICKS = 120;      // safety cap: forces classification even if stillness never comes
+let FINAL_PORTION_TICKS = 10;     // how many of the most recent ticks count as the "final portion"
+let GESTURE_FINAL_WEIGHT = 0.5;   // blend: 0 = whole-gesture average only, 1 = final portion only
+let RESET_SETTLE_TICKS = 3;       // ticks ignored right after a commit while the SNN reset settles
+let GESTURE_COMMIT_MIN_PROB = 0.45; // the whole-gesture leader's blended score must be at least this
+let GESTURE_COMMIT_MARGIN = 0.15;   // ...and beat the runner-up by this much
+let STILL_HOLD_TICKS = 40;        // ticks of continued stillness (after any letter) before a space is typed
 let DELETE_REPEAT_MS = 800;
 let ANN_COMMIT_MIN_PROB = 0.50;
 let ANN_CONFIRM_WINDOWS = 1;
@@ -385,6 +410,15 @@ async function idbSet(key,val){
   return new Promise((resolve,reject)=>{
     const tx = db.transaction('kv','readwrite');
     tx.objectStore('kv').put(val,key);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  });
+}
+async function idbDelete(key){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readwrite');
+    tx.objectStore('kv').delete(key);
     tx.oncomplete=()=>resolve();
     tx.onerror=()=>reject(tx.error);
   });
@@ -502,6 +536,30 @@ const Store = {
     return items;
   },
 
+  // Removes one sample and renumbers the rest (s0.csv, s1.csv, ...) so a later
+  // capture - which always names itself by the current count - can never
+  // collide with a higher-numbered file left behind by the deletion.
+  async deleteSample(classIdx, name){
+    if (this.mode==='fs' && this.rootHandle){
+      const dir = await this._classDir(classIdx, false);
+      const remaining = (await this.listSamples(classIdx)).filter(it=>it.name!==name);
+      await dir.removeEntry(name);
+      for (const it of remaining) await dir.removeEntry(it.name);
+      for (let i=0;i<remaining.length;i++){
+        const fh = await dir.getFileHandle('s'+i+'.csv', {create:true});
+        const w = await fh.createWritable();
+        await w.write(remaining[i].text);
+        await w.close();
+      }
+    } else {
+      const prefix = 'motion/'+CLASSES[classIdx].folder+'/';
+      const remaining = (await this.listSamples(classIdx)).filter(it=>it.name!==name);
+      await idbDelete(prefix+name);
+      for (const it of remaining) await idbDelete(prefix+it.name);
+      for (let i=0;i<remaining.length;i++) await idbSet(prefix+'s'+i+'.csv', remaining[i].text);
+    }
+  },
+
   async writeWeightFile(name, arrayBuffer){
     if (this.mode==='fs' && this.rootHandle){
       const hdr = await this.rootHandle.getDirectoryHandle('header', {create:true});
@@ -605,6 +663,7 @@ async function exportAllZip(){
   log(`Exported ${entries.length} file(s) to imu-motion-data.zip.`);
 }
 async function importEntry(name, data){
+  if (!name || name.endsWith('/')) return;   // directory entries in the zip - nothing to import
   if (name.startsWith('motion/') && name.endsWith('.csv')){
     const rest = name.substring('motion/'.length);
     const slash = rest.indexOf('/');
@@ -1208,36 +1267,136 @@ function commitClass(classIdx, mayRepeat){
   } else {
     outputString += text; onOutputChanged();
   }
-  resetOutputDebounceSnn();
-  cooldown = COOLDOWN_TICKS;
   snnResetDynamics();
 }
 
-let probRing, ringPos=0, ringFill=0, cooldown=0, leadClass=0, leadProb=0;
-function resetOutputDebounceSnn(){
-  probRing = Array.from({length:WINDOW_TICKS},()=>new Float32Array(NUM_CLASSES));
-  ringPos=0; ringFill=0; cooldown=0; leadClass=0; leadProb=0;
+// ---- SNN gesture segmentation (mirrors myGestureTick/myClassifyGesture) ----
+// Motion is read straight from the spike encoder's own idle channel: a tick
+// is "moving" whenever any axis spiked (the idle channel did NOT fire).
+let gestureState = 'IDLE';   // 'IDLE' | 'ACTIVE' | 'ENDING' | 'COOLDOWN'
+let gestureTicks = 0, onsetMoveStreak = 0, stillStreak = 0, idleStillStreak = 0, settleTicksLeft = 0;
+let gestureProbSum = new Float32Array(NUM_CLASSES);
+let gestureEvidenceTicks = 0;
+let finalRing, finalRingPos = 0, finalRingFill = 0;
+let liveBestClass = 0, liveBestProb = 0;
+
+function resetGestureEvidence(){
+  gestureProbSum.fill(0);
+  gestureEvidenceTicks = 0;
+  finalRing = Array.from({length:FINAL_PORTION_TICKS},()=>new Float32Array(NUM_CLASSES));
+  finalRingPos = 0; finalRingFill = 0;
 }
-function updateOutputStringSnn(scores){
-  if (cooldown>0){ cooldown--; return; }
-  const p = Float32Array.from(scores);
+function resetGestureState(){
+  gestureState = 'IDLE';
+  gestureTicks=0; onsetMoveStreak=0; stillStreak=0; idleStillStreak=0; settleTicksLeft=0;
+  resetGestureEvidence();
+  liveBestClass=0; liveBestProb=0;
+}
+resetGestureEvidence();
+
+// Turns the live trace into a probability distribution, masking out any
+// class with no training data yet.
+function snnMaskedProbs(){
+  const p = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++) p[c] = activeClassMask[c] ? streamTrace[c] : -1e30;
   softmaxInPlace(p);
-  probRing[ringPos].set(p);
-  ringPos=(ringPos+1)%WINDOW_TICKS;
-  if (ringFill<WINDOW_TICKS) ringFill++;
-  if (ringFill<WINDOW_TICKS) return;
-  const mean = new Float32Array(NUM_CLASSES);
-  for (let r=0;r<WINDOW_TICKS;r++) for (let c=0;c<NUM_CLASSES;c++) mean[c]+=probRing[r][c];
-  for (let c=0;c<NUM_CLASSES;c++) mean[c]/=WINDOW_TICKS;
-  let best=0, second=-1;
-  for (let c=1;c<NUM_CLASSES;c++) if (mean[c]>mean[best]) best=c;
-  for (let c=0;c<NUM_CLASSES;c++){ if (c===best) continue; if (second===-1||mean[c]>mean[second]) second=c; }
-  leadClass=best; leadProb=mean[best];
-  if (mean[best] < COMMIT_MIN_PROB) return;
-  if (mean[best]-mean[second] < COMMIT_MARGIN) return;
-  if (verboseInfer) log(`[SNN-live] COMMIT ${CLASSES[best].label} p=${mean[best].toFixed(2)} margin=${(mean[best]-mean[second]).toFixed(2)}`);
-  commitClass(best, true);
+  return p;
 }
+function gestureAccumulate(p){
+  for (let c=0;c<NUM_CLASSES;c++) gestureProbSum[c]+=p[c];
+  gestureEvidenceTicks++;
+  finalRing[finalRingPos].set(p);
+  finalRingPos=(finalRingPos+1)%FINAL_PORTION_TICKS;
+  if (finalRingFill<FINAL_PORTION_TICKS) finalRingFill++;
+}
+// The ONE decision for a completed gesture - blends the whole-gesture average
+// with the average over just the final portion. "Still" is excluded here; it
+// has no motion to segment, so it can only come from the idle-stillness timeout.
+function classifyGesture(){
+  const n = Math.max(gestureEvidenceTicks,1);
+  const avgP = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++) avgP[c]=gestureProbSum[c]/n;
+  const fn = Math.max(finalRingFill,1);
+  const finalP = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++){ let s=0; for (let r=0;r<finalRingFill;r++) s+=finalRing[r][c]; finalP[c]=s/fn; }
+  const blended = new Float32Array(NUM_CLASSES);
+  for (let c=0;c<NUM_CLASSES;c++) blended[c] = (1-GESTURE_FINAL_WEIGHT)*avgP[c] + GESTURE_FINAL_WEIGHT*finalP[c];
+
+  let best=-1, second=-1;
+  for (let c=0;c<NUM_CLASSES;c++){
+    if (!activeClassMask[c] || c===STILL_CLASS_IDX) continue;
+    if (best===-1 || blended[c]>blended[best]){ second=best; best=c; }
+    else if (second===-1 || blended[c]>blended[second]) second=c;
+  }
+  const margin = (best>=0 && second>=0) ? blended[best]-blended[second] : (best>=0 ? blended[best] : 0);
+
+  if (verboseInfer){
+    let line = '[FINAL] ';
+    for (let c=0;c<NUM_CLASSES;c++) if (activeClassMask[c] && c!==STILL_CLASS_IDX) line += `${CLASSES[c].label}=${blended[c].toFixed(2)} `;
+    log(line + `margin=${margin.toFixed(2)}`);
+  }
+
+  const longEnough = gestureTicks >= MIN_GESTURE_TICKS;
+  const confident = best>=0 && blended[best]>=GESTURE_COMMIT_MIN_PROB && margin>=GESTURE_COMMIT_MARGIN;
+  if (best>=0 && longEnough && confident){
+    if (verboseInfer) log(`[COMMIT] ${CLASSES[best].label}`);
+    commitClass(best, true);   // internally resets the SNN dynamics
+  } else {
+    if (verboseInfer) log(`[COMMIT] none (${!longEnough ? 'gesture too short' : 'not confident enough'})`);
+    snnResetDynamics();
+  }
+}
+// Call once per tick with this tick's raw spike sample and a tick counter
+// (used only for the [GESTURE] START log line).
+function gestureTick(spikeTick, currentTick){
+  const moving = spikeTick[SNN_IDLE_CH] < 0.5;
+
+  if (gestureState==='COOLDOWN'){
+    if (--settleTicksLeft <= 0) gestureState = 'IDLE';
+    return;
+  }
+
+  if (gestureState==='IDLE'){
+    if (moving){ onsetMoveStreak++; idleStillStreak=0; } else { onsetMoveStreak=0; idleStillStreak++; }
+    if (onsetMoveStreak >= GESTURE_ONSET_TICKS){
+      gestureState = 'ACTIVE';
+      gestureTicks = onsetMoveStreak;   // the onset ticks already counted as part of the gesture
+      stillStreak = 0;
+      resetGestureEvidence();
+      if (verboseInfer) log(`[GESTURE] START tick=${currentTick}`);
+    } else if (STILL_CLASS_IDX>=0 && idleStillStreak >= STILL_HOLD_TICKS){
+      // Sustained stillness with nothing else going on = a space. Safe to
+      // call every tick past the threshold: commitClass() no-ops if "Still"
+      // is already the last thing that was typed.
+      commitClass(STILL_CLASS_IDX, true);
+    }
+    return;
+  }
+
+  // ACTIVE or ENDING
+  gestureTicks++;
+  const p = snnMaskedProbs();
+  gestureAccumulate(p);
+  liveBestClass = argmaxActive(p);
+  liveBestProb = p[liveBestClass];
+
+  if (moving){ stillStreak=0; gestureState='ACTIVE'; } else { stillStreak++; gestureState='ENDING'; }
+
+  if (verboseInfer && gestureTicks%4===0){
+    log(`[GESTURE] ACTIVE tick=${gestureTicks} best=${CLASSES[liveBestClass].label} p=${liveBestProb.toFixed(2)}`);
+  }
+
+  const endedByStillness = stillStreak >= GESTURE_END_STILL_TICKS;
+  const endedByMaxLength = gestureTicks >= MAX_GESTURE_TICKS;
+  if (endedByStillness || endedByMaxLength){
+    if (verboseInfer) log(`[GESTURE] END duration=${gestureTicks} stillTicks=${stillStreak}${endedByMaxLength?' (max length reached)':''}`);
+    classifyGesture();
+    gestureState = 'COOLDOWN';
+    settleTicksLeft = RESET_SETTLE_TICKS;
+    onsetMoveStreak = 0;
+  }
+}
+
 let annPendingClass=-1, annPendingWindows=0;
 function resetOutputDebounceAnn(){ annPendingClass=-1; annPendingWindows=0; }
 function updateOutputStringAnn(pred, prob){
@@ -1262,11 +1421,21 @@ async function refreshCollectCount(){
   document.getElementById('collectTitle').textContent = `Collect: ${CLASSES[collectClassIdx].label}`;
   document.getElementById('collectCount').textContent = `${n} sample(s) saved so far.`;
 }
+// Whole-page color cue so it's obvious, without watching the console, exactly
+// when to get ready and when to move: amber = get ready, green = recording now,
+// back to normal the instant this rep's capture window ends.
+function setCollectIndicator(state /* 'ready' | 'recording' | null */){
+  document.body.classList.toggle('collect-ready', state==='ready');
+  document.body.classList.toggle('collect-recording', state==='recording');
+}
 async function captureOneSample(classIdx){
   log('[Collect] Recording in 1s...');
+  setCollectIndicator('ready');
   await sleep(1000);
+  setCollectIndicator('recording');
   const samples = [];
   await sampleGesture((t,v)=>{ samples[t]=v; });
+  setCollectIndicator(null);
   const name = await Store.captureSample(classIdx, toCsv(samples));
   const n = await Store.countSamples(classIdx);
   log(`[Collect] Saved ${name} for '${CLASSES[classIdx].label}' (total ${n}).`);
@@ -1505,24 +1674,19 @@ async function actionInferAnn(){
 async function actionInferSnnContinuous(){
   if (!Snn.trained){ log('[SNN] No trained weights yet - run Train SNN or Train+Infer SNN first.'); return; }
   await refreshActiveClassMask();
-  resetOutputDebounceSnn();
+  resetGestureState();
   snnResetStreamState();
   const enc = makeSpikeEncoder();
   stopRequested = false;
-  log('[SNN] Move the phone. Tap STOP to return.');
+  log('[SNN] Draw a letter, then pause - it commits once the gesture ends. Tap STOP to return.');
   let tickCount=0;
   const spikeTmp = new Float32Array(SNN_CHANNELS);
-  const masked = new Float32Array(NUM_CLASSES);
   while (!stopRequested){
     const tS = performance.now();
     enc.step(readAccelG(), spikeTmp);
-    const pred = snnTick(spikeTmp, false, 0);
+    snnTick(spikeTmp, false, 0);   // the SNN always streams, regardless of gesture state
     tickCount++;
-    for (let c=0;c<NUM_CLASSES;c++) masked[c] = activeClassMask[c] ? streamTrace[c] : -1e30;
-    updateOutputStringSnn(masked);
-    if (verboseInfer && tickCount%8===0){
-      log(`[SNN-live] tick=${tickCount} pred=${CLASSES[pred].label} lead=${CLASSES[leadClass].label} p=${leadProb.toFixed(2)}${cooldown>0?' (cooldown)':''}`);
-    }
+    gestureTick(spikeTmp, tickCount);   // decides START/ACTIVE/END/COMMIT
     const el = performance.now()-tS;
     if (el<SAMPLE_INTERVAL_MS) await sleep(SAMPLE_INTERVAL_MS-el);
   }
@@ -1567,11 +1731,31 @@ async function printStatus(){
   s += `\nSNN: trained=${Snn.trained} freeze conv1=${Snn.freezeConv1} dense1=${Snn.freezeDense1} dense2=${Snn.freezeDense2} output=${Snn.freezeOutput} adamStep=${Snn.adamStep}`;
   s += `\nTraining: lr=${LEARNING_RATE} batch=${BATCH_SIZE} epochs/loop=${TARGET_EPOCHS} valSamples=${VALIDATION_SAMPLES}`;
   s += `\nSNN params: LIF_THRESHOLD=${LIF_THRESHOLD} LIF_LEAK=${LIF_LEAK} SNN_TRACE_LEAK=${SNN_TRACE_LEAK} SPIKE_DELTA_G=${SPIKE_DELTA_G}`;
-  s += `\nOutput engine: SNN window=${WINDOW_TICKS} minProb=${COMMIT_MIN_PROB} margin=${COMMIT_MARGIN} cooldown=${COOLDOWN_TICKS} | ANN minProb=${ANN_COMMIT_MIN_PROB} confirm=${ANN_CONFIRM_WINDOWS} | Delete repeat=${DELETE_REPEAT_MS}ms`;
+  s += `\nOutput engine (SNN gestures): onset=${GESTURE_ONSET_TICKS} endStill=${GESTURE_END_STILL_TICKS} min=${MIN_GESTURE_TICKS} max=${MAX_GESTURE_TICKS} finalPortion=${FINAL_PORTION_TICKS}(w=${GESTURE_FINAL_WEIGHT}) minProb=${GESTURE_COMMIT_MIN_PROB} margin=${GESTURE_COMMIT_MARGIN} settle=${RESET_SETTLE_TICKS} stillHold=${STILL_HOLD_TICKS}`;
+  s += `\nOutput engine (ANN): minProb=${ANN_COMMIT_MIN_PROB} confirm=${ANN_CONFIRM_WINDOWS} | Delete repeat=${DELETE_REPEAT_MS}ms`;
   s += `\nTranscript: "${outputString}"`;
   s += `\nStorage: ${Store.mode==='fs' ? 'real folder ('+(Store.rootHandle?Store.rootHandle.name:'?')+')' : 'in-browser (IndexedDB) - use Export for real files'}`;
   s += '\n==============';
   log(s);
+}
+
+// Loads ANN/SNN weights and calibration from whatever Store currently points
+// at (the chosen real folder, or IndexedDB). Used at page load and again
+// whenever the person points the page at a (possibly different) real folder,
+// so existing header/ binaries in that folder are picked up automatically -
+// no manual "Upload" step needed.
+async function loadModelsAndCalibFromStore(){
+  const annLoaded = await annLoadWeights();
+  const snnLoaded = await snnLoadWeights();
+  const calibBuf = await Store.readWeightFile(CALIB_FILE);
+  let calibLoaded = false;
+  if (calibBuf && calibBuf.byteLength===24){
+    const dv = new DataView(calibBuf);
+    for (let a=0;a<3;a++) myAccelMean[a]=dv.getFloat32(a*4,true);
+    for (let a=0;a<3;a++) myAccelStd[a]=dv.getFloat32(12+a*4,true);
+    calibLoaded = true;
+  }
+  return { annLoaded, snnLoaded, calibLoaded };
 }
 
 // ======================================================================
@@ -1600,10 +1784,16 @@ function buildSettingsUI(){
     ['SNN LIF leak', ()=>LIF_LEAK, v=>LIF_LEAK=v, 0.01],
     ['SNN LIF threshold', ()=>LIF_THRESHOLD, v=>LIF_THRESHOLD=v, 0.01],
     ['SNN trace leak', ()=>SNN_TRACE_LEAK, v=>SNN_TRACE_LEAK=v, 0.01],
-    ['SNN window ticks', ()=>WINDOW_TICKS, v=>WINDOW_TICKS=Math.round(v), 1],
-    ['SNN commit min prob', ()=>COMMIT_MIN_PROB, v=>COMMIT_MIN_PROB=v, 0.01],
-    ['SNN commit margin', ()=>COMMIT_MARGIN, v=>COMMIT_MARGIN=v, 0.01],
-    ['SNN cooldown ticks', ()=>COOLDOWN_TICKS, v=>COOLDOWN_TICKS=Math.round(v), 1],
+    ['Gesture onset ticks', ()=>GESTURE_ONSET_TICKS, v=>GESTURE_ONSET_TICKS=Math.round(v), 1],
+    ['Gesture end-still ticks', ()=>GESTURE_END_STILL_TICKS, v=>GESTURE_END_STILL_TICKS=Math.round(v), 1],
+    ['Min gesture ticks', ()=>MIN_GESTURE_TICKS, v=>MIN_GESTURE_TICKS=Math.round(v), 1],
+    ['Max gesture ticks', ()=>MAX_GESTURE_TICKS, v=>MAX_GESTURE_TICKS=Math.round(v), 1],
+    ['Final portion ticks', ()=>FINAL_PORTION_TICKS, v=>FINAL_PORTION_TICKS=Math.round(v), 1],
+    ['Final portion weight', ()=>GESTURE_FINAL_WEIGHT, v=>GESTURE_FINAL_WEIGHT=v, 0.05],
+    ['Reset settle ticks', ()=>RESET_SETTLE_TICKS, v=>RESET_SETTLE_TICKS=Math.round(v), 1],
+    ['Gesture commit min prob', ()=>GESTURE_COMMIT_MIN_PROB, v=>GESTURE_COMMIT_MIN_PROB=v, 0.01],
+    ['Gesture commit margin', ()=>GESTURE_COMMIT_MARGIN, v=>GESTURE_COMMIT_MARGIN=v, 0.01],
+    ['Still hold ticks', ()=>STILL_HOLD_TICKS, v=>STILL_HOLD_TICKS=Math.round(v), 1],
     ['Delete repeat (ms)', ()=>DELETE_REPEAT_MS, v=>DELETE_REPEAT_MS=Math.round(v), 10],
     ['ANN commit min prob', ()=>ANN_COMMIT_MIN_PROB, v=>ANN_COMMIT_MIN_PROB=v, 0.01],
     ['ANN confirm windows', ()=>ANN_CONFIRM_WINDOWS, v=>ANN_CONFIRM_WINDOWS=Math.round(v), 1],
@@ -1623,12 +1813,34 @@ function buildViewerUI(){
   sel.onchange = refreshRepDropdown;
   refreshRepDropdown();
 }
+function updateDeleteRepButton(){
+  const repSel = document.getElementById('viewRepSelect').value;
+  document.getElementById('btnDeleteRep').disabled = (repSel==='all' || repSel===undefined || repSel==='');
+}
 async function refreshRepDropdown(){
   const classIdx = parseInt(document.getElementById('viewClassSelect').value)||0;
   const items = await Store.listSamples(classIdx);
   const sel = document.getElementById('viewRepSelect');
   sel.innerHTML = '<option value="all">All reps (ax overlay)</option>' +
     items.map((it,i)=>`<option value="${i}">${it.name}</option>`).join('');
+  updateDeleteRepButton();
+}
+// Deletes only the single rep currently chosen in the dropdown - "All reps" is
+// disabled on the button on purpose, so this can never wipe a whole class.
+async function deleteSelectedRep(){
+  const classIdx = parseInt(document.getElementById('viewClassSelect').value)||0;
+  const repSel = document.getElementById('viewRepSelect').value;
+  if (repSel==='all') return;
+  const items = await Store.listSamples(classIdx);
+  const it = items[parseInt(repSel)];
+  if (!it) return;
+  if (!confirm(`Delete ${CLASSES[classIdx].label} / ${it.name}? This cannot be undone.`)) return;
+  await Store.deleteSample(classIdx, it.name);
+  log(`[Delete] Removed ${it.name} from '${CLASSES[classIdx].label}'.`);
+  document.getElementById('plotlyDiv').innerHTML = '';
+  await refreshActiveClassMask();
+  buildClassGrid();
+  await refreshRepDropdown();
 }
 async function renderPlot(){
   const classIdx = parseInt(document.getElementById('viewClassSelect').value)||0;
@@ -1660,7 +1872,15 @@ async function renderPlot(){
 function wireUI(){
   document.getElementById('btnEnableMotion').onclick = enableMotionSensors;
   document.getElementById('btnCalibrate').onclick = async ()=>{ setBusy(true); await calibrate(); setBusy(false); };
-  document.getElementById('btnChooseFolder').onclick = async ()=>{ await Store.chooseFolder(); buildClassGrid(); };
+  document.getElementById('btnChooseFolder').onclick = async ()=>{
+    const ok = await Store.chooseFolder();
+    if (ok){
+      const { annLoaded, snnLoaded, calibLoaded } = await loadModelsAndCalibFromStore();
+      log(`[Folder] Auto-loaded from header/: ${annLoaded?'ANN weights':'no ANN weights'}, ${snnLoaded?'SNN weights':'no SNN weights'}, ${calibLoaded?'calibration':'no calibration'}.`);
+      await refreshActiveClassMask();
+    }
+    buildClassGrid();
+  };
   document.getElementById('btnExportZip').onclick = exportAllZip;
   document.getElementById('fileImportZip').onchange = async (e)=>{ if (e.target.files[0]){ setBusy(true); await importZipFile(e.target.files[0]); setBusy(false); e.target.value=''; } };
 
@@ -1698,6 +1918,8 @@ function wireUI(){
   document.getElementById('frzAnnOut').onchange = e=>Ann.freezeOutput=e.target.checked;
 
   document.getElementById('btnRenderPlot').onclick = renderPlot;
+  document.getElementById('viewRepSelect').addEventListener('change', updateDeleteRepButton);
+  document.getElementById('btnDeleteRep').onclick = deleteSelectedRep;
 }
 
 // ======================================================================
@@ -1709,14 +1931,7 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   snnInit();
   wireUI();
   await Store.init();
-  const annLoaded = await annLoadWeights();
-  const snnLoaded = await snnLoadWeights();
-  const calibBuf = await Store.readWeightFile(CALIB_FILE);
-  if (calibBuf && calibBuf.byteLength===24){
-    const dv = new DataView(calibBuf);
-    for (let a=0;a<3;a++) myAccelMean[a]=dv.getFloat32(a*4,true);
-    for (let a=0;a<3;a++) myAccelStd[a]=dv.getFloat32(12+a*4,true);
-  }
+  const { annLoaded, snnLoaded } = await loadModelsAndCalibFromStore();
   await refreshActiveClassMask();
   buildClassGrid();
   buildSettingsUI();
